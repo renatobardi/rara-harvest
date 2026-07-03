@@ -24,6 +24,10 @@
 		{ key: 'cancelled', label: t.tasks.colCancelled, statuses: ['cancelled'] }
 	];
 
+	if (import.meta.env.DEV && COLS.length !== 5) {
+		console.warn(`tasks board: COLS has ${COLS.length} entries but grid is hardcoded to lg:grid-cols-5`);
+	}
+
 	let tasks = $state<AgentTask[]>([]);
 	let loading = $state(true);
 	let error = $state(false);
@@ -97,7 +101,8 @@
 	{:else if tasks.length === 0}
 		<p class="text-[13px] text-muted">{t.tasks.empty}</p>
 	{:else}
-		<div class="grid gap-3" style="grid-template-columns: repeat({COLS.length}, minmax(0, 1fr))">
+		<!-- COLS has 5 entries; if you add a column update lg:grid-cols-5 below. -->
+		<div class="grid grid-cols-1 gap-3 lg:grid-cols-5">
 			{#each COLS as col (col.key)}
 				{@const colTasks = tasksForCol(col)}
 				<div class="flex flex-col gap-2">

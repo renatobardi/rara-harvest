@@ -1052,7 +1052,7 @@
 		>
 			{#if wizardStep === 1}
 				<h2 id="fontes-wizard-title" class="mb-4 text-[15px] font-semibold">{t.fontes.wizardStep1Title}</h2>
-				<div class="grid grid-cols-2 gap-2 sm:grid-cols-3">
+				<div class="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
 					{#each kinds as k}
 						<button
 							class="flex flex-col items-start gap-1 rounded-token border border-border p-3 text-left hover:border-text/40 hover:bg-hover"
