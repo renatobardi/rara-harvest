@@ -83,7 +83,7 @@
 	<p class="text-red">{t.pipeline.error}</p>
 {:else if data}
 	<!-- Contadores por status -->
-	<div class="mb-6 grid grid-cols-7 gap-3">
+	<div class="mb-6 grid grid-cols-3 gap-2 sm:grid-cols-7 sm:gap-3">
 		{#each STATUSES as st}
 			<div class="rounded-card border border-border bg-surface p-3 text-center">
 				<div class="flex items-center justify-center gap-1.5 text-[11px] text-muted">

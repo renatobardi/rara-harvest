@@ -8,6 +8,13 @@
 	let { children } = $props();
 
 	let paletteOpen = $state(false);
+	let sidebarOpen = $state(false);
+
+	// Close drawer on route change (no-op on desktop where lg:translate-x-0 always shows sidebar).
+	$effect(() => {
+		$page.url.pathname;
+		sidebarOpen = false;
+	});
 
 	// Clean is the default; Dark is opt-in and persisted. The pre-paint script in app.html already
 	// applied the saved choice before render; this syncs the toggle's state to it once on mount.
@@ -26,6 +33,9 @@
 		if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
 			e.preventDefault();
 			paletteOpen = true;
+		}
+		if (e.key === 'Escape' && sidebarOpen && !paletteOpen) {
+			sidebarOpen = false;
 		}
 	}
 
@@ -66,8 +76,31 @@
 
 <CommandPalette bind:open={paletteOpen} />
 
-<div class="grid h-screen grid-cols-app overflow-hidden">
-	<aside class="flex flex-col gap-0.5 bg-sidebar p-3">
+<!-- Backdrop: closes the drawer when tapped (mobile/tablet only). -->
+{#if sidebarOpen}
+	<div
+		class="fixed inset-0 z-30 bg-black/40 lg:hidden"
+		aria-hidden="true"
+		onclick={() => (sidebarOpen = false)}
+	></div>
+{/if}
+
+<div class="relative h-screen overflow-hidden lg:grid lg:grid-cols-app">
+	<!-- Sidebar: fixed overlay on mobile/tablet; static grid column on lg+. -->
+	<aside
+		id="sidebar-nav"
+		class="fixed inset-y-0 left-0 z-40 flex w-sidebar flex-col gap-0.5 bg-sidebar p-3
+		       transition-transform duration-200 ease-in-out
+		       lg:relative lg:z-auto lg:transition-none
+		       {sidebarOpen ? 'translate-x-0' : '-translate-x-full'} lg:translate-x-0"
+	>
+		<!-- Close button: mobile/tablet only. -->
+		<button
+			class="mb-2 self-end rounded-token p-1.5 text-muted hover:bg-hover lg:hidden"
+			aria-label="Fechar menu"
+			onclick={() => (sidebarOpen = false)}
+		>✕</button>
+
 		<div class="flex items-center gap-2 px-2 pb-4 pt-2 text-[15px] font-semibold">
 			<span
 				aria-label="rara"
@@ -113,17 +146,36 @@
 
 	<main class="overflow-x-hidden overflow-y-auto bg-bg">
 		<div
-			class="sticky top-0 z-10 flex items-center gap-4 border-b border-border px-6 py-3 backdrop-blur-md"
+			class="sticky top-0 z-10 flex items-center gap-3 border-b border-border px-4 py-3 backdrop-blur-md sm:gap-4 sm:px-6"
 			style="background:color-mix(in srgb, var(--bg) 82%, transparent)"
 		>
-			<h1 class="m-0 text-[17px] font-semibold">{pageTitles[$page.url.pathname] ?? $page.url.pathname.slice(1)}</h1>
+			<!-- Hamburger: mobile/tablet only. -->
 			<button
-				class="ml-auto flex min-w-[220px] cursor-pointer items-center gap-2 rounded-pill border border-border bg-surface-2 px-3.5 py-[7px] text-[13px] text-muted"
+				class="flex h-[34px] w-[34px] flex-none cursor-pointer items-center justify-center
+				       rounded-token border-0 bg-transparent text-muted hover:bg-hover lg:hidden"
+				onclick={() => (sidebarOpen = true)}
+				aria-label="Abrir menu de navegação"
+				aria-expanded={sidebarOpen}
+				aria-controls="sidebar-nav"
+			>
+				<svg viewBox="0 0 20 20" width="18" height="18" fill="none" stroke="currentColor"
+				     stroke-width="1.6" stroke-linecap="round" aria-hidden="true">
+					<path d="M3 5h14M3 10h14M3 15h14"/>
+				</svg>
+			</button>
+
+			<h1 class="m-0 min-w-0 flex-1 truncate text-[17px] font-semibold">
+				{pageTitles[$page.url.pathname] ?? $page.url.pathname.slice(1)}
+			</h1>
+			<button
+				class="flex cursor-pointer items-center gap-2 rounded-pill border border-border
+				       bg-surface-2 px-3.5 py-[7px] text-[13px] text-muted sm:min-w-[220px]"
 				onclick={() => (paletteOpen = true)}
 				aria-label="Abrir command palette (⌘K)"
 			>
-				⌕ {t.topbar.search}
-				<kbd class="ml-auto text-[11px] opacity-50">⌘K</kbd>
+				⌕
+				<span class="hidden sm:inline">{t.topbar.search}</span>
+				<kbd class="ml-auto hidden sm:inline text-[11px] opacity-50">⌘K</kbd>
 			</button>
 			<button
 				class="flex h-[34px] w-[34px] cursor-pointer items-center justify-center rounded-token border-0 bg-transparent text-muted hover:bg-hover"
@@ -143,7 +195,7 @@
 			</button>
 		</div>
 
-		<div class="mx-auto max-w-[1180px] p-6">
+		<div class="mx-auto max-w-[1180px] p-4 sm:p-6">
 			{@render children()}
 		</div>
 	</main>

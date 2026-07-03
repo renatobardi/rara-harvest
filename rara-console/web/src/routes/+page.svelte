@@ -36,7 +36,7 @@
 {:else if error}
 	<p class="text-red">{t.overview.error}</p>
 {:else}
-	<div class="mb-6 grid grid-cols-3 gap-4">
+	<div class="mb-6 grid grid-cols-1 gap-4 sm:grid-cols-3">
 		<div class="rounded-card border border-border bg-surface p-4">
 			<div class="text-xs text-muted">{t.overview.kpiFlows}</div>
 			<div class="mt-2 text-[30px] font-bold tracking-tight">{flows.length}</div>
@@ -51,7 +51,7 @@
 		</div>
 	</div>
 
-	<div class="grid grid-cols-2 gap-4">
+	<div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
 		<div class="overflow-hidden rounded-card border border-border bg-surface">
 			<h2 class="m-0 border-b border-border px-4 py-3 text-[13.5px] font-semibold">
 				{t.overview.flowsPanel}

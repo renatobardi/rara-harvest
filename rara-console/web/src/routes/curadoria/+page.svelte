@@ -432,7 +432,7 @@
 				{t.curadoria.pulsoProposedPending}
 			</a>
 		{/if}
-		<div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
+		<div class="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
 			{#each pulsoCards as card}
 				<div class="rounded-card border border-border bg-surface px-4 py-3">
 					<div class="text-[11px] text-muted">{card.label}</div>
@@ -878,7 +878,7 @@
 							class="w-full rounded-token border border-border bg-surface-2 px-2 py-1 text-[13px] focus:outline-none focus:ring-1 focus:ring-primary/50"
 						></textarea>
 					</div>
-					<div class="grid grid-cols-2 gap-3">
+					<div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
 						<div>
 							<label class="mb-1 block text-[11px] text-muted" for="prop-topics">{t.curadoria.profileTopicsLabel}</label>
 							<textarea id="prop-topics" rows="3" bind:value={proposeTopics}
