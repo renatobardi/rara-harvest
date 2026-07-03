@@ -24,6 +24,10 @@
 		{ key: 'cancelled', label: t.tasks.colCancelled, statuses: ['cancelled'] }
 	];
 
+	if (import.meta.env.DEV && COLS.length !== 5) {
+		console.warn(`tasks board: COLS has ${COLS.length} entries but grid is hardcoded to lg:grid-cols-5`);
+	}
+
 	let tasks = $state<AgentTask[]>([]);
 	let loading = $state(true);
 	let error = $state(false);

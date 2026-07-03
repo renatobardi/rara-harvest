@@ -9,11 +9,27 @@
 
 	let paletteOpen = $state(false);
 	let sidebarOpen = $state(false);
+	let isNarrow = $state(false);
+	let closeBtn = $state<HTMLButtonElement | null>(null);
 
 	// Close drawer on route change (no-op on desktop where lg:translate-x-0 always shows sidebar).
 	$effect(() => {
 		$page.url.pathname;
 		sidebarOpen = false;
+	});
+
+	// Track whether we're below the lg breakpoint so inert is applied only on mobile/tablet.
+	$effect(() => {
+		const mq = window.matchMedia('(max-width: 1023px)');
+		isNarrow = mq.matches;
+		const handler = (e: MediaQueryListEvent) => { isNarrow = e.matches; };
+		mq.addEventListener('change', handler);
+		return () => mq.removeEventListener('change', handler);
+	});
+
+	// Move focus to the close button when the drawer opens so keyboard users land inside it.
+	$effect(() => {
+		if (sidebarOpen && closeBtn) closeBtn.focus();
 	});
 
 	// Clean is the default; Dark is opt-in and persisted. The pre-paint script in app.html already
@@ -89,13 +105,16 @@
 	<!-- Sidebar: fixed overlay on mobile/tablet; static grid column on lg+. -->
 	<aside
 		id="sidebar-nav"
+		inert={isNarrow && !sidebarOpen ? true : undefined}
+		aria-hidden={isNarrow && !sidebarOpen || undefined}
 		class="fixed inset-y-0 left-0 z-40 flex w-sidebar flex-col gap-0.5 bg-sidebar p-3
 		       transition-transform duration-200 ease-in-out
 		       lg:relative lg:z-auto lg:transition-none
 		       {sidebarOpen ? 'translate-x-0' : '-translate-x-full'} lg:translate-x-0"
 	>
-		<!-- Close button: mobile/tablet only. -->
+		<!-- Close button: mobile/tablet only. Focus lands here when the drawer opens. -->
 		<button
+			bind:this={closeBtn}
 			class="mb-2 self-end rounded-token p-1.5 text-muted hover:bg-hover lg:hidden"
 			aria-label="Fechar menu"
 			onclick={() => (sidebarOpen = false)}
