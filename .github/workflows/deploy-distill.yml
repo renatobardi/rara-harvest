@@ -8,7 +8,7 @@ name: Deploy rara-distill
 # (amd64 for Cloud Run + arm64 for VPC Oracle Ampere + Mac) and pushes a manifest list to
 # Artifact Registry. Cloud Run pulls the amd64 leaf automatically. See DOCKER-MULTIMODULE.md.
 #
-# Env: DISTILL_PROVIDER=distill (matches the provider seed); LITELLM_MODEL=groq/llama-3.3-70b-versatile
+# Env: DISTILL_PROVIDER=distill-cloud (matches the provider seed); LITELLM_MODEL=groq/llama-3.3-70b-versatile
 # hardcoded (70b) — distill needs 70b for quality; vars.LITELLM_MODEL=gemini-flash is
 # spend-capped → ignored. Edit this YAML to change the model. (Same reasoning as deploy-sift.yml.)
 on:
@@ -124,11 +124,13 @@ jobs:
         run: |
           # Update first, create if absent (avoids a describe→create/update TOCTOU race).
           # DATABASE_URL is the shared contract DB; LITELLM_API_KEY is distill-specific.
-          # DISTILL_PROVIDER=distill matches the provider seed in the DB.
+          # DISTILL_PROVIDER=distill-cloud matches the provider seed in the DB (migration
+          # 019_rename_providers.sql renamed the placement from 'distill' — this env var went
+          # stale until 2026-07-04, when Cloud Run silently claimed nothing under the old name).
           # NOTE: groq/llama-3.3-70b-versatile (70b) — distill needs 70b for quality, and
           # vars.LITELLM_MODEL=gemini-flash is spend-capped (429s) so it must NOT be used.
           SECRETS="DATABASE_URL=database-url:latest,LITELLM_API_KEY=litellm-api-key:latest"
-          ENV_VARS="DISTILL_PROVIDER=distill,LITELLM_BASE_URL=$LITELLM_BASE_URL,LITELLM_MODEL=groq/llama-3.3-70b-versatile"
+          ENV_VARS="DISTILL_PROVIDER=distill-cloud,LITELLM_BASE_URL=$LITELLM_BASE_URL,LITELLM_MODEL=groq/llama-3.3-70b-versatile"
           COMMON_ARGS="--image $IMAGE --region $REGION --project $GCP_PROJECT --set-secrets $SECRETS --set-env-vars $ENV_VARS --max-retries 0 --task-timeout 3600s --memory 512Mi --cpu 1"
 
           UPDATE_ERR=$(gcloud run jobs update "$JOB_NAME" $COMMON_ARGS 2>&1) && echo "$UPDATE_ERR" || {
