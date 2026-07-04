@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"embed"
@@ -12,6 +13,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strconv"
 	"strings"
@@ -35,10 +37,11 @@ var library embed.FS
 // Engine identifiers (CURATE_ENGINE) and their default models. The stored/​hashed
 // engine string is the combined "engine/model" form.
 const (
-	engineGemini  = "gemini"
-	engineClaude  = "claude"
-	engineGroq    = "groq"
-	engineLiteLLM = "litellm"
+	engineGemini    = "gemini"
+	engineClaude    = "claude"
+	engineGroq      = "groq"
+	engineLiteLLM   = "litellm"
+	engineClaudeCLI = "claude-cli" // local Claude Code CLI (subscription session, no API key)
 
 	defaultGeminiModel  = "gemini-3.1-pro-preview"
 	defaultClaudeModel  = "claude-sonnet-4-6"
@@ -193,6 +196,7 @@ type Config struct {
 	GroqAPIKey      string
 	GeminiModel     string
 	ClaudeModel     string
+	ClaudeCLIBin    string // CLAUDE_CLI_BIN: absolute path to the `claude` binary (launchd has a minimal PATH); empty = "claude"
 	GroqModel       string
 	LiteLLMBaseURL  string // LITELLM_BASE_URL: the self-hosted gateway's OpenAI-compatible base
 	LiteLLMAPIKey   string // LITELLM_API_KEY: optional gateway master key (omitted if empty)
@@ -545,9 +549,16 @@ func NewCurator(cfg Config) (Curator, string, error) {
 		}
 		model := orDefault(cfg.LiteLLMModel, defaultLiteLLMModel)
 		return newLiteLLMCurator(cfg.LiteLLMBaseURL, cfg.LiteLLMAPIKey, model), engineLiteLLM + "/" + model, nil
+	case engineClaudeCLI:
+		// No API key: the CLI bills the logged-in subscription session (the whole point —
+		// INFERENCE-ROUTING.pt-BR.md's "assinatura CLI" tier). Engine label matches the rows
+		// distill_opus.py historically wrote (claude-cli/<model>).
+		bin := orDefault(cfg.ClaudeCLIBin, "claude")
+		model := orDefault(cfg.ClaudeModel, defaultClaudeModel)
+		return newClaudeCLICurator(bin, model), engineClaudeCLI + "/" + model, nil
 	default:
-		return nil, "", fmt.Errorf("unknown CURATE_ENGINE %q (use %q, %q, %q or %q)",
-			cfg.Engine, engineGemini, engineClaude, engineGroq, engineLiteLLM)
+		return nil, "", fmt.Errorf("unknown CURATE_ENGINE %q (use %q, %q, %q, %q or %q)",
+			cfg.Engine, engineGemini, engineClaude, engineGroq, engineLiteLLM, engineClaudeCLI)
 	}
 }
 
@@ -722,6 +733,89 @@ func parseBreakerThreshold(s string) (int, error) {
 type rateLimitedError struct{ msg string }
 
 func (e *rateLimitedError) Error() string { return e.msg }
+
+// ---------------------------------------------------------------------------
+// Real curator: Claude Code CLI (subscription session — no API key)
+// ---------------------------------------------------------------------------
+
+// claudeCLICurator shells out to the local `claude` binary in headless print mode — the exact
+// invocation distill_opus.py proved in production: system prompt via --append-system-prompt,
+// transcript via stdin (argv has an OS length cap), JSON envelope on stdout. Auth is the CLI's
+// own logged-in session; the child env is sanitized so it can never fall back to the API key.
+type claudeCLICurator struct {
+	bin   string
+	model string
+}
+
+func newClaudeCLICurator(bin, model string) *claudeCLICurator {
+	return &claudeCLICurator{bin: bin, model: model}
+}
+
+func (c *claudeCLICurator) Curate(ctx context.Context, systemPrompt, input string) (string, error) {
+	cmd := exec.CommandContext(ctx, c.bin,
+		"-p",
+		"--output-format", "json",
+		"--model", c.model,
+		"--append-system-prompt", systemPrompt,
+	)
+	cmd.Stdin = strings.NewReader(input)
+	cmd.Env = claudeCLIEnv(os.Environ())
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+
+	if err := cmd.Run(); err != nil {
+		msg := fmt.Sprintf("claude CLI: %v: %s", err, truncate(stderr.String(), 500))
+		if isUsageLimitMsg(stderr.String()) {
+			return "", &rateLimitedError{msg: msg}
+		}
+		return "", errors.New(msg)
+	}
+
+	var env struct {
+		IsError bool   `json:"is_error"`
+		Subtype string `json:"subtype"`
+		Result  string `json:"result"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
+		return "", fmt.Errorf("claude CLI returned non-JSON envelope: %s", truncate(stdout.String(), 200))
+	}
+	if env.IsError || env.Subtype != "success" {
+		msg := fmt.Sprintf("claude CLI error (%s): %s", env.Subtype, truncate(env.Result, 500))
+		if isUsageLimitMsg(env.Result) {
+			return "", &rateLimitedError{msg: msg}
+		}
+		return "", errors.New(msg)
+	}
+	return env.Result, nil
+}
+
+// claudeCLIEnv strips vars that would make the child CLI believe it runs nested inside another
+// Claude Code session (multica's buildEnv lesson), plus the API key so the call can only bill
+// the logged-in subscription.
+func claudeCLIEnv(parent []string) []string {
+	out := make([]string, 0, len(parent))
+	for _, kv := range parent {
+		if strings.HasPrefix(kv, "CLAUDECODE") || strings.HasPrefix(kv, "CLAUDE_CODE_") || strings.HasPrefix(kv, "ANTHROPIC_API_KEY=") {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
+}
+
+// isUsageLimitMsg reports whether a CLI failure reads as the subscription's usage/rate wall, so
+// it is typed rateLimitedError and withBreaker halts the drain instead of burning attempts.
+// ponytail: substring heuristic over the CLI's human-facing text; tighten if a structured error
+// code ever lands in the -p envelope.
+func isUsageLimitMsg(s string) bool {
+	l := strings.ToLower(s)
+	for _, marker := range []string{"rate limit", "usage limit", "limit reached", "429"} {
+		if strings.Contains(l, marker) {
+			return true
+		}
+	}
+	return false
+}
 
 // withBreaker wraps the handler with a 429 circuit breaker: after threshold CONSECUTIVE
 // rate-limited items it wraps the error with addon.ErrStopDrain, so the SDK requeues the current
@@ -1321,6 +1415,7 @@ func loadConfig() Config {
 		GroqAPIKey:      os.Getenv("GROQ_API_KEY"),
 		GeminiModel:     os.Getenv("GEMINI_MODEL"),
 		ClaudeModel:     os.Getenv("CLAUDE_MODEL"),
+		ClaudeCLIBin:    os.Getenv("CLAUDE_CLI_BIN"),
 		GroqModel:       os.Getenv("GROQ_MODEL"),
 		LiteLLMBaseURL:  os.Getenv("LITELLM_BASE_URL"),
 		LiteLLMAPIKey:   os.Getenv("LITELLM_API_KEY"),

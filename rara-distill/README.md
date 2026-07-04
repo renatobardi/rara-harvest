@@ -26,13 +26,15 @@ isolation: rara-distill never calls Kura.
 - **Tables**: `distillations` (own, domain); reads `transcripts`, `channel_videos`,
   `playlist_videos`, and `flow_steps` (the per-item recipe config). The CONTRACT tables
   (`item_steps`/`providers`/`items`) are handled by the SDK's `PgxStore`.
-- **Runtime**: **VPC-first** — primary execution is `distill-vpc` on the VPC Oracle, where
-  `rara-runner agent` runs the container via `docker run --pull=always` with
-  `CURATE_ENGINE=litellm` + `LITELLM_MODEL=groq-llama` (LiteLLM gateway at `172.17.0.1:4010`
-  on the host). Cloud Run (`distill-cloud`) is the ordered fallback. One provider per deploy
-  (`DISTILL_PROVIDER`, e.g. `distill-vpc` on the VPC / `distill` on Cloud Run). on_demand by
-  default (drain once and exit); resident + symmetric activation via `WORK_POLL_INTERVAL` /
-  `POKE_ADDR`.
+- **Runtime**: **Mac-first** (2026-07) — primary execution is `distill-mac`: a native binary
+  installed by [install-mac.sh](./install-mac.sh) as a resident launchd agent, running
+  `CURATE_ENGINE=claude-cli` (the local Claude Code CLI's logged-in subscription — no per-token
+  cost, no free-tier daily caps; this is INFERENCE-ROUTING's "assinatura CLI" tier realized as
+  a direct engine instead of a LiteLLM shim). `distill-vpc` (docker + litellm/groq) and
+  `distill-cloud` (Cloud Run) still exist but are disabled: groq's free tier (100k tokens/day)
+  can't even sustain the normal daily inflow. One provider per deploy (`DISTILL_PROVIDER`).
+  on_demand by default (drain once and exit); resident + symmetric activation via
+  `WORK_POLL_INTERVAL` / `POKE_ADDR` (the Mac install runs resident, 30s poll).
 
 ## How it works
 

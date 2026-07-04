@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -969,6 +970,157 @@ func TestHandlerRecipeDefaultWhenNoConfig(t *testing.T) {
 	}
 	if store.saved[0].Pattern != "extract_wisdom" {
 		t.Errorf("pattern = %q, want extract_wisdom (default)", store.saved[0].Pattern)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// claudeCLICurator — Claude Code CLI as engine (subscription session, no API key)
+// ---------------------------------------------------------------------------
+
+// writeFakeClaude drops an executable shell script standing in for the `claude` binary and
+// returns its path plus the capture dir (the script records argv, stdin and env there).
+func writeFakeClaude(t *testing.T, body string) (bin, dir string) {
+	t.Helper()
+	dir = t.TempDir()
+	bin = filepath.Join(dir, "claude")
+	script := "#!/bin/sh\nDIR=\"" + dir + "\"\nprintf '%s\\n' \"$@\" > \"$DIR/args\"\ncat > \"$DIR/stdin\"\nenv > \"$DIR/env\"\n" + body
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return bin, dir
+}
+
+// envelope builds the `claude -p --output-format json` result envelope the curator parses.
+func claudeEnvelope(t *testing.T, subtype string, isError bool, result string) string {
+	t.Helper()
+	b, err := json.Marshal(map[string]any{"subtype": subtype, "is_error": isError, "result": result})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// TestClaudeCLICuratorHappyPath: the curator invokes the CLI headless with the right flags,
+// pipes the transcript via stdin, and returns the envelope's result text.
+func TestClaudeCLICuratorHappyPath(t *testing.T) {
+	env := claudeEnvelope(t, "success", false, curationJSON("# Curated", "sum"))
+	bin, dir := writeFakeClaude(t, "printf '%s' '"+strings.ReplaceAll(env, "'", "'\\''")+"'\n")
+
+	c := newClaudeCLICurator(bin, "claude-sonnet-4-6")
+	out, err := c.Curate(context.Background(), "SYSTEM PROMPT", "the transcript body")
+	if err != nil {
+		t.Fatalf("Curate: %v", err)
+	}
+	if !strings.Contains(out, "content_markdown") {
+		t.Errorf("out = %q, want the envelope result payload", out)
+	}
+
+	args, _ := os.ReadFile(filepath.Join(dir, "args"))
+	for _, want := range []string{"-p", "--output-format\njson", "--model\nclaude-sonnet-4-6", "--append-system-prompt\nSYSTEM PROMPT"} {
+		if !strings.Contains(string(args), want) {
+			t.Errorf("argv missing %q; argv:\n%s", want, args)
+		}
+	}
+	stdin, _ := os.ReadFile(filepath.Join(dir, "stdin"))
+	if string(stdin) != "the transcript body" {
+		t.Errorf("stdin = %q, want the raw transcript", stdin)
+	}
+}
+
+// TestClaudeCLICuratorSanitizesEnv: the child must not inherit vars that would make the CLI
+// think it runs nested inside another Claude Code session, nor an API key (the whole point is
+// billing the logged-in subscription, never the API).
+func TestClaudeCLICuratorSanitizesEnv(t *testing.T) {
+	t.Setenv("CLAUDECODE", "1")
+	t.Setenv("CLAUDE_CODE_ENTRYPOINT", "cli")
+	t.Setenv("ANTHROPIC_API_KEY", "sk-test-leak")
+	env := claudeEnvelope(t, "success", false, curationJSON("# ok", "d"))
+	bin, dir := writeFakeClaude(t, "printf '%s' '"+strings.ReplaceAll(env, "'", "'\\''")+"'\n")
+
+	c := newClaudeCLICurator(bin, "claude-sonnet-4-6")
+	if _, err := c.Curate(context.Background(), "s", "i"); err != nil {
+		t.Fatalf("Curate: %v", err)
+	}
+	childEnv, _ := os.ReadFile(filepath.Join(dir, "env"))
+	for _, banned := range []string{"CLAUDECODE=", "CLAUDE_CODE_ENTRYPOINT=", "ANTHROPIC_API_KEY="} {
+		if strings.Contains(string(childEnv), banned) {
+			t.Errorf("child env leaked %q", banned)
+		}
+	}
+}
+
+// TestClaudeCLICuratorExitError: a non-zero exit surfaces stderr in the error and is NOT typed
+// rate-limited by default.
+func TestClaudeCLICuratorExitError(t *testing.T) {
+	bin, _ := writeFakeClaude(t, "echo 'boom: something broke' >&2\nexit 1\n")
+	c := newClaudeCLICurator(bin, "m")
+	_, err := c.Curate(context.Background(), "s", "i")
+	if err == nil || !strings.Contains(err.Error(), "something broke") {
+		t.Fatalf("err = %v, want stderr surfaced", err)
+	}
+	var rl *rateLimitedError
+	if errors.As(err, &rl) {
+		t.Errorf("generic CLI failure must not be typed rate-limited")
+	}
+}
+
+// TestClaudeCLICuratorUsageLimitIsRateLimited: when the CLI reports the subscription usage
+// limit (in the envelope or on stderr), the error must be typed rateLimitedError so withBreaker
+// counts it and halts the drain instead of burning the queue's attempts.
+func TestClaudeCLICuratorUsageLimitIsRateLimited(t *testing.T) {
+	cases := map[string]string{
+		"envelope": "printf '%s' '" + strings.ReplaceAll(
+			claudeEnvelope(t, "error_during_execution", true, "5-hour usage limit reached. Try again later."),
+			"'", "'\\''") + "'\n",
+		"stderr": "echo 'Rate limit exceeded, retry after some time' >&2\nexit 1\n",
+	}
+	for name, body := range cases {
+		bin, _ := writeFakeClaude(t, body)
+		c := newClaudeCLICurator(bin, "m")
+		_, err := c.Curate(context.Background(), "s", "i")
+		var rl *rateLimitedError
+		if !errors.As(err, &rl) {
+			t.Errorf("%s: err = %v, want typed rateLimitedError", name, err)
+		}
+	}
+}
+
+// TestClaudeCLICuratorNonJSONEnvelope: garbage on stdout is an error, not silently treated as
+// model output.
+func TestClaudeCLICuratorNonJSONEnvelope(t *testing.T) {
+	bin, _ := writeFakeClaude(t, "printf 'plain text, not an envelope'\n")
+	c := newClaudeCLICurator(bin, "m")
+	if _, err := c.Curate(context.Background(), "s", "i"); err == nil {
+		t.Fatal("expected error for a non-JSON envelope")
+	}
+}
+
+// TestNewCuratorClaudeCLI: CURATE_ENGINE=claude-cli wires the subprocess curator with the
+// CLAUDE_MODEL default and the claude-cli/<model> engine label (matching the historical rows
+// distill_opus.py wrote), honoring CLAUDE_CLI_BIN for launchd's minimal PATH.
+func TestNewCuratorClaudeCLI(t *testing.T) {
+	cur, name, err := NewCurator(Config{Engine: "claude-cli", ClaudeCLIBin: "/opt/custom/claude"})
+	if err != nil {
+		t.Fatalf("NewCurator: %v", err)
+	}
+	if name != "claude-cli/claude-sonnet-4-6" {
+		t.Errorf("engine name = %q, want claude-cli/claude-sonnet-4-6 (default model)", name)
+	}
+	c, ok := cur.(*claudeCLICurator)
+	if !ok {
+		t.Fatalf("curator type = %T, want *claudeCLICurator", cur)
+	}
+	if c.bin != "/opt/custom/claude" {
+		t.Errorf("bin = %q, want the CLAUDE_CLI_BIN override", c.bin)
+	}
+
+	// No bin configured -> bare "claude" from PATH; no API key required.
+	cur2, _, err := NewCurator(Config{Engine: "claude-cli", ClaudeModel: "claude-opus-4-8"})
+	if err != nil {
+		t.Fatalf("NewCurator default bin: %v", err)
+	}
+	if c2 := cur2.(*claudeCLICurator); c2.bin != "claude" || c2.model != "claude-opus-4-8" {
+		t.Errorf("got bin=%q model=%q, want claude/claude-opus-4-8", c2.bin, c2.model)
 	}
 }
 
