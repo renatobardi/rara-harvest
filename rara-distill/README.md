@@ -26,13 +26,15 @@ isolation: rara-distill never calls Kura.
 - **Tables**: `distillations` (own, domain); reads `transcripts`, `channel_videos`,
   `playlist_videos`, and `flow_steps` (the per-item recipe config). The CONTRACT tables
   (`item_steps`/`providers`/`items`) are handled by the SDK's `PgxStore`.
-- **Runtime**: **VPC-first** — primary execution is `distill-vpc` on the VPC Oracle, where
-  `rara-runner agent` runs the container via `docker run --pull=always` with
-  `CURATE_ENGINE=litellm` + `LITELLM_MODEL=groq-llama` (LiteLLM gateway at `172.17.0.1:4010`
-  on the host). Cloud Run (`distill-cloud`) is the ordered fallback. One provider per deploy
-  (`DISTILL_PROVIDER`, e.g. `distill-vpc` on the VPC / `distill` on Cloud Run). on_demand by
-  default (drain once and exit); resident + symmetric activation via `WORK_POLL_INTERVAL` /
-  `POKE_ADDR`.
+- **Runtime**: **Mac-first** (2026-07) — primary execution is `distill-mac`: a native binary
+  installed by [install-mac.sh](./install-mac.sh) as a resident launchd agent, running
+  `CURATE_ENGINE=claude-cli` (the local Claude Code CLI's logged-in subscription — no per-token
+  cost, no free-tier daily caps; this is INFERENCE-ROUTING's "assinatura CLI" tier realized as
+  a direct engine instead of a LiteLLM shim). `distill-vpc` (docker + litellm/groq) and
+  `distill-cloud` (Cloud Run) still exist but are disabled: groq's free tier (100k tokens/day)
+  can't even sustain the normal daily inflow. One provider per deploy (`DISTILL_PROVIDER`).
+  on_demand by default (drain once and exit); resident + symmetric activation via
+  `WORK_POLL_INTERVAL` / `POKE_ADDR` (the Mac install runs resident, 30s poll).
 
 ## How it works
 
@@ -175,9 +177,10 @@ go run .                      # claim & drain the destilar queue for DISTILL_PRO
 | `DISTILL_PROVIDER` | — (required) | the provider this worker serves (e.g. `distill` \| `distill-vpc`); the SDK claims its steps by `(destilar, this provider)` |
 | `WORK_POLL_INTERVAL` | (unset → on_demand) | resident safety-net poll cadence (Go duration or bare seconds) |
 | `POKE_ADDR` / `POKE_TOKEN` | (unset) | tailnet poke listener (`POST /poke`, Bearer) for symmetric activation |
-| `CURATE_ENGINE` | `gemini` | `gemini` \| `claude` \| `groq` \| `litellm` |
-| `GEMINI_API_KEY` / `ANTHROPIC_API_KEY` / `GROQ_API_KEY` | — | per engine |
-| `GEMINI_MODEL` / `CLAUDE_MODEL` / `GROQ_MODEL` | sane defaults | model override |
+| `CURATE_ENGINE` | `gemini` | `gemini` \| `claude` \| `groq` \| `litellm` \| `claude-cli` (Mac-first default, see [install-mac.sh](./install-mac.sh)) |
+| `GEMINI_API_KEY` / `ANTHROPIC_API_KEY` / `GROQ_API_KEY` | — | per engine (not used by `claude-cli` — it bills the CLI's logged-in subscription, no key) |
+| `GEMINI_MODEL` / `CLAUDE_MODEL` / `GROQ_MODEL` | sane defaults | model override (`CLAUDE_MODEL` also selects the `claude-cli` model) |
+| `CLAUDE_CLI_BIN` | `claude` (from `PATH`) | absolute path to the `claude` binary for `CURATE_ENGINE=claude-cli` — launchd has a minimal `PATH` |
 | `LITELLM_BASE_URL` / `LITELLM_API_KEY` / `LITELLM_MODEL` | — / — / `claude-sonnet-4-6` | self-hosted gateway (OpenAI-compatible); key optional. See [litellm/](./litellm/) |
 | `DISTILL_PATTERNS` | `extract_wisdom` | **fallback** default recipe (CSV; many = session chain). Per-item recipe normally comes from `flow_steps.options.recipe` |
 | `DISTILL_CONTEXT` | (none) | fallback default context file in `contexts/<name>.md` |
