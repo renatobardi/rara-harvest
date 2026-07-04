@@ -10,6 +10,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // fakeStore is an in-memory Store: it enforces the same contract the pgx impl does (the claim's
@@ -337,7 +338,7 @@ func TestRequeueThenFailAtCeiling(t *testing.T) {
 
 	// One runOnce: transient -> re-queued pending, not failed; heartbeat cleared.
 	w := &worker{cfg: withDefaults(cfg), h: h}
-	if _, err := w.runOnce(context.Background()); err != nil {
+	if _, _, err := w.runOnce(context.Background()); err != nil {
 		t.Fatalf("runOnce: %v", err)
 	}
 	got := s.getStep(1, 3)
@@ -378,6 +379,102 @@ func TestRunItemNotFoundFailsStep(t *testing.T) {
 	}
 	if len(seen) != 0 {
 		t.Error("handler must not run for a vanished item")
+	}
+}
+
+// TestStopDrainRequeuesAndHalts: a handler error wrapping ErrStopDrain (circuit breaker: the
+// upstream is rate-limiting, hammering on is pointless) re-queues the current step AND halts the
+// drain — the remaining pending steps stay untouched for a later run, instead of each burning an
+// attempt against a dead upstream.
+func TestStopDrainRequeuesAndHalts(t *testing.T) {
+	s := newFakeStore()
+	seedOneStep(s, 1, 3, capT, prov, "a")
+	seedOneStep(s, 2, 3, capT, prov, "b")
+	calls := 0
+	h := func(context.Context, Item, Step) (Result, error) {
+		calls++
+		return Result{}, fmt.Errorf("upstream rate-limited: %w", ErrStopDrain)
+	}
+
+	if err := Run(context.Background(), Config{Capability: capT, Provider: prov, Store: s}, h); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("handler ran %d times, want 1 (drain must halt after the stop signal)", calls)
+	}
+	got := s.getStep(1, 3)
+	if got.Status != StatusPending {
+		t.Errorf("stopped step should be re-queued pending, got %q", got.Status)
+	}
+	if got.Attempt != 1 {
+		t.Errorf("attempt = %d, want 1 (the claim's bump, nothing more)", got.Attempt)
+	}
+	if got.HeartbeatAt != nil {
+		t.Error("re-queued step should have its heartbeat cleared")
+	}
+	second := s.getStep(2, 3)
+	if second.Status != StatusPending || second.Attempt != 0 {
+		t.Errorf("second step must never be claimed after the halt, got %+v", second)
+	}
+}
+
+// TestStopDrainAtCeilingFailsStepButStillHalts: ErrStopDrain at the attempt ceiling fails the
+// current step for good (same rule as a retryable miss) — but the drain still halts so the rest
+// of the queue is spared.
+func TestStopDrainAtCeilingFailsStepButStillHalts(t *testing.T) {
+	s := newFakeStore()
+	s.addItem(Item{ID: 1, SourceRef: "a", Status: "discovered"})
+	s.addStep(Step{ItemID: 1, Seq: 3, Capability: capT, AssignedProvider: prov, Attempt: DefaultMaxAttempts - 1})
+	seedOneStep(s, 2, 3, capT, prov, "b")
+	h := func(context.Context, Item, Step) (Result, error) {
+		return Result{}, fmt.Errorf("upstream rate-limited: %w", ErrStopDrain)
+	}
+
+	if err := Run(context.Background(), Config{Capability: capT, Provider: prov, Store: s}, h); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := s.getStep(1, 3); got.Status != StatusFailed {
+		t.Errorf("step at ceiling = %q, want failed", got.Status)
+	} else if got.Attempt != DefaultMaxAttempts {
+		t.Errorf("attempt = %d, want the ceiling %d", got.Attempt, DefaultMaxAttempts)
+	}
+	if second := s.getStep(2, 3); second.Status != StatusPending || second.Attempt != 0 {
+		t.Errorf("second step must never be claimed after the halt, got %+v", second)
+	}
+}
+
+// TestHandlerErrorTruncatedOnPersist: a huge handler error (e.g. an upstream HTTP body echoed
+// into the message) is capped before it is written to the contract table, so item_steps.error
+// never carries an unbounded — possibly sensitive — payload.
+func TestHandlerErrorTruncatedOnPersist(t *testing.T) {
+	s := newFakeStore()
+	seedOneStep(s, 1, 3, capT, prov, "vid1")
+	huge := strings.Repeat("x", 5000)
+	h := func(context.Context, Item, Step) (Result, error) { return Result{}, errors.New(huge) }
+
+	if err := Run(context.Background(), Config{Capability: capT, Provider: prov, Store: s}, h); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	got := s.getStep(1, 3)
+	if got.Status != StatusFailed {
+		t.Fatalf("step = %q, want failed", got.Status)
+	}
+	if len(got.errMsg) > maxErrLen+len("…") {
+		t.Errorf("persisted error is %d bytes, want capped at %d", len(got.errMsg), maxErrLen)
+	}
+}
+
+// TestTruncateErrKeepsValidUTF8: a multibyte error message that lands exactly past maxErrLen must
+// not be cut mid-rune — s[:maxErrLen] on raw bytes can split a multibyte rune and produce invalid
+// UTF-8, which the contract-table write must never carry.
+func TestTruncateErrKeepsValidUTF8(t *testing.T) {
+	huge := "x" + strings.Repeat("é", 5000) // leading ASCII byte forces the cutoff mid-rune
+	got := truncateErr(huge)
+	if !utf8.ValidString(got) {
+		t.Errorf("truncateErr produced invalid UTF-8: %q", got)
+	}
+	if len(got) > maxErrLen+len("…") {
+		t.Errorf("truncated to %d bytes, want capped near %d", len(got), maxErrLen)
 	}
 }
 

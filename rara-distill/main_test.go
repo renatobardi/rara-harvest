@@ -429,6 +429,45 @@ func TestCurateGivesUpAfterMaxRetries(t *testing.T) {
 	}
 }
 
+// TestCurateExhausted429IsTypedRateLimited: a 429 that survives every retry surfaces as a typed
+// rateLimitedError, so downstream (distillDoc -> handler -> breaker) can detect it with errors.As
+// instead of matching on the message text.
+func TestCurateExhausted429IsTypedRateLimited(t *testing.T) {
+	curateRetryBase = time.Millisecond
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":"rate limit"}`))
+	}))
+	defer srv.Close()
+
+	g := &groqCurator{apiKey: "k", model: "m", endpoint: srv.URL}
+	_, err := g.Curate(context.Background(), "s", "i")
+	var rl *rateLimitedError
+	if !errors.As(err, &rl) {
+		t.Fatalf("err = %v, want a *rateLimitedError", err)
+	}
+	if !strings.Contains(err.Error(), "LLM API error (status 429)") {
+		t.Errorf("error text must keep postWithRetry's standard format, got %q", err.Error())
+	}
+}
+
+// TestCurateExhausted5xxIsNotRateLimited: an exhausted 5xx must NOT read as rate-limited — the
+// breaker only counts 429s.
+func TestCurateExhausted5xxIsNotRateLimited(t *testing.T) {
+	curateRetryBase = time.Millisecond
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	g := &groqCurator{apiKey: "k", model: "m", endpoint: srv.URL}
+	_, err := g.Curate(context.Background(), "s", "i")
+	var rl *rateLimitedError
+	if errors.As(err, &rl) {
+		t.Fatalf("a 503 must not be typed rate-limited, got %v", err)
+	}
+}
+
 func TestCurateDoesNotRetryOn4xx(t *testing.T) {
 	var calls int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -930,6 +969,151 @@ func TestHandlerRecipeDefaultWhenNoConfig(t *testing.T) {
 	}
 	if store.saved[0].Pattern != "extract_wisdom" {
 		t.Errorf("pattern = %q, want extract_wisdom (default)", store.saved[0].Pattern)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// withBreaker — 429 circuit breaker over the handler (stops the drain, not the item)
+// ---------------------------------------------------------------------------
+
+// err429 mimics the handler's failed-distillation error for a groq 429: retryable (the SDK
+// requeues it) carrying the typed rateLimitedError the breaker detects with errors.As.
+func err429() error {
+	return fmt.Errorf("destilar v: %w: %w", addon.ErrRetryable,
+		&rateLimitedError{msg: "LLM API error (status 429): rate limit reached"})
+}
+
+// TestHandlerWraps429AsRateLimited: when the curation failed on a (typed) 429, the handler's
+// retryable error must carry the rateLimitedError through the chain so withBreaker can count it.
+func TestHandlerWraps429AsRateLimited(t *testing.T) {
+	store := newMockStore()
+	store.docs["vid1"] = SourceDoc{SourceKey: "vid1", SourceRef: "vid1", Transcript: "x"}
+	cur := &MockCurator{err: &rateLimitedError{msg: "LLM API error (status 429): rate limit reached"}}
+	h := distillHandler(store, cur, "mock/engine", newRecipeResolver(nil, "", ""))
+
+	_, err := h(context.Background(), addon.Item{SourceRef: "vid1", FlowID: 1}, addon.Step{Seq: 1})
+	if !errors.Is(err, addon.ErrRetryable) {
+		t.Errorf("429 failure must stay retryable, got %v", err)
+	}
+	var rl *rateLimitedError
+	if !errors.As(err, &rl) {
+		t.Errorf("handler must carry the typed 429 through, got %v", err)
+	}
+
+	// A non-429 curation failure must NOT read as rate-limited.
+	cur2 := &MockCurator{err: errors.New("LLM API error (status 500): boom")}
+	h2 := distillHandler(store, cur2, "mock/engine", newRecipeResolver(nil, "", ""))
+	_, err = h2(context.Background(), addon.Item{SourceRef: "vid1", FlowID: 1}, addon.Step{Seq: 1})
+	if errors.As(err, &rl) {
+		t.Errorf("a 500 must not be typed rate-limited, got %v", err)
+	}
+}
+
+// TestBreakerTripsAfterConsecutive429s: below the threshold the error passes through untouched
+// (retryable, no stop); the Nth consecutive 429 additionally wraps addon.ErrStopDrain so the SDK
+// requeues the item AND halts the drain.
+func TestBreakerTripsAfterConsecutive429s(t *testing.T) {
+	inner := func(context.Context, addon.Item, addon.Step) (addon.Result, error) {
+		return addon.Result{}, err429()
+	}
+	h := withBreaker(inner, 3)
+
+	for i := 1; i <= 2; i++ {
+		_, err := h(context.Background(), addon.Item{}, addon.Step{})
+		if errors.Is(err, addon.ErrStopDrain) {
+			t.Fatalf("breaker tripped early at 429 #%d, threshold is 3", i)
+		}
+		if !errors.Is(err, addon.ErrRetryable) {
+			t.Errorf("429 #%d must stay retryable, got %v", i, err)
+		}
+	}
+	_, err := h(context.Background(), addon.Item{}, addon.Step{})
+	if !errors.Is(err, addon.ErrStopDrain) {
+		t.Errorf("3rd consecutive 429 must trip the breaker, got %v", err)
+	}
+	if !errors.Is(err, addon.ErrRetryable) {
+		t.Errorf("tripped error must stay retryable so the step is requeued, got %v", err)
+	}
+}
+
+// TestBreakerResetsOnNon429: a success or a non-429 failure between 429s resets the streak — the
+// breaker only trips on CONSECUTIVE rate-limits (isolated blips must not halt the drain).
+func TestBreakerResetsOnNon429(t *testing.T) {
+	responses := []error{
+		err429(),
+		err429(),
+		nil, // success resets
+		err429(),
+		fmt.Errorf("destilar v: %w: LLM API error (status 500): boom", addon.ErrRetryable), // non-429 resets
+		err429(),
+		err429(),
+	}
+	i := 0
+	inner := func(context.Context, addon.Item, addon.Step) (addon.Result, error) {
+		err := responses[i]
+		i++
+		return addon.Result{}, err
+	}
+	h := withBreaker(inner, 3)
+
+	for range responses {
+		if _, err := h(context.Background(), addon.Item{}, addon.Step{}); errors.Is(err, addon.ErrStopDrain) {
+			t.Fatalf("breaker must not trip without 3 consecutive 429s (call %d)", i)
+		}
+	}
+}
+
+// TestBreakerRecoversAfterTrip: a tripped breaker is not stuck — after the trip, a success starts
+// a fresh streak, and it takes another full run of consecutive 429s to trip again (the resident-
+// worker case, where the same wrapped handler serves many drains).
+func TestBreakerRecoversAfterTrip(t *testing.T) {
+	responses := []error{
+		err429(), err429(), err429(), // trip
+		nil,                // success resets the streak
+		err429(), err429(), // below threshold again
+		err429(), // trips once more
+	}
+	i := 0
+	inner := func(context.Context, addon.Item, addon.Step) (addon.Result, error) {
+		err := responses[i]
+		i++
+		return addon.Result{}, err
+	}
+	h := withBreaker(inner, 3)
+
+	trips := []bool{false, false, true, false, false, false, true}
+	for call, want := range trips {
+		_, err := h(context.Background(), addon.Item{}, addon.Step{})
+		if got := errors.Is(err, addon.ErrStopDrain); got != want {
+			t.Errorf("call %d: stop = %v, want %v (err %v)", call+1, got, want, err)
+		}
+	}
+}
+
+// TestParseBreakerThreshold: unset -> default 3; a positive integer is honored; garbage or a
+// non-positive value is a config error (fail-fast, never a silent default).
+func TestParseBreakerThreshold(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    int
+		wantErr bool
+	}{
+		{"", 3, false},
+		{"5", 5, false},
+		{"1", 1, false},
+		{"0", 0, true},
+		{"-2", 0, true},
+		{"abc", 0, true},
+	}
+	for _, c := range cases {
+		got, err := parseBreakerThreshold(c.in)
+		if c.wantErr != (err != nil) {
+			t.Errorf("parseBreakerThreshold(%q) err = %v, wantErr %v", c.in, err, c.wantErr)
+			continue
+		}
+		if !c.wantErr && got != c.want {
+			t.Errorf("parseBreakerThreshold(%q) = %d, want %d", c.in, got, c.want)
+		}
 	}
 }
 

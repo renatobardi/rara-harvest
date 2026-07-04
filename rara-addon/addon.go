@@ -32,6 +32,7 @@ import (
 	"fmt"
 	"log"
 	"time"
+	"unicode/utf8"
 )
 
 // DefaultMaxAttempts caps how many times a transient (retryable) step is re-queued before it is
@@ -41,6 +42,10 @@ const DefaultMaxAttempts = 5
 // defaultHeartbeatInterval is the resident heartbeat cadence when neither HeartbeatInterval nor a
 // derivable PollInterval is set.
 const defaultHeartbeatInterval = 30 * time.Second
+
+// maxErrLen caps the handler error persisted on the contract table (and echoed in logs): an
+// upstream HTTP body baked into an error message must never land unbounded in item_steps.error.
+const maxErrLen = 1000
 
 // Step status values written back on the item_steps contract table.
 const (
@@ -55,6 +60,13 @@ const (
 // request a requeue (up to MaxAttempts) instead of a terminal failure. Any other error fails the
 // step for good.
 var ErrRetryable = errors.New("addon: retryable: output not yet available")
+
+// ErrStopDrain marks a circuit-breaker trip: the upstream the handler depends on is degraded
+// (e.g. sustained rate-limiting), so continuing the drain would only burn the queue's attempts.
+// The current step is re-queued like a retryable miss (failed at the ceiling), and the drain
+// halts — remaining pending steps are left for a later run. A resident worker resumes on its
+// next poke/poll; an on_demand worker exits.
+var ErrStopDrain = errors.New("addon: stop drain: upstream degraded")
 
 // Item is the minimal view of a spine item the SDK reads and a handler needs. It is NOT the
 // worker's domain row — the handler reads that itself, keyed by SourceRef.
@@ -242,15 +254,21 @@ func (w *worker) heartbeatLoop(ctx context.Context, interval time.Duration) {
 	}
 }
 
-// drain claims and processes steps until the queue is empty (or ctx is done / a store error).
+// drain claims and processes steps until the queue is empty (or ctx is done / a store error /
+// the handler trips the circuit breaker with ErrStopDrain).
 func (w *worker) drain(ctx context.Context) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		claimed, err := w.runOnce(ctx)
+		claimed, stop, err := w.runOnce(ctx)
 		if err != nil {
 			return err
+		}
+		if stop {
+			log.Printf("addon %s/%s: drain halted by handler (circuit breaker); remaining steps left pending",
+				w.cfg.Capability, w.cfg.Provider)
+			return nil
 		}
 		if !claimed {
 			return nil
@@ -258,14 +276,15 @@ func (w *worker) drain(ctx context.Context) error {
 	}
 }
 
-// runOnce claims and processes a single step. claimed=false means the queue was empty.
-func (w *worker) runOnce(ctx context.Context) (claimed bool, err error) {
+// runOnce claims and processes a single step. claimed=false means the queue was empty;
+// stop=true means the handler signalled ErrStopDrain and the drain must halt.
+func (w *worker) runOnce(ctx context.Context) (claimed, stop bool, err error) {
 	step, err := w.cfg.Store.Claim(ctx, w.cfg.Capability, w.cfg.Provider)
 	if err != nil {
-		return false, err
+		return false, false, fmt.Errorf("claim: %w", err)
 	}
 	if step == nil {
-		return false, nil // nothing pending for this (capability, provider)
+		return false, false, nil // nothing pending for this (capability, provider)
 	}
 
 	// Proof of life: this worker just pulled work as assigned_provider, so stamp its heartbeat.
@@ -278,24 +297,26 @@ func (w *worker) runOnce(ctx context.Context) (claimed bool, err error) {
 
 	item, found, err := w.cfg.Store.GetItem(ctx, step.ItemID)
 	if err != nil {
-		return true, err
+		return true, false, fmt.Errorf("get item %d: %w", step.ItemID, err)
 	}
 	if !found {
 		// The item vanished (cascade delete?) between claim and read. Fail the orphan step so it
 		// leaves the running set.
-		return true, w.cfg.Store.Mark(ctx, *step, StatusFailed, "", "item not found")
+		return true, false, wrapErr("mark orphan failed", w.cfg.Store.Mark(ctx, *step, StatusFailed, "", "item not found"))
 	}
 
 	res, runErr := w.h(ctx, item, *step)
 	if runErr != nil {
-		if errors.Is(runErr, ErrRetryable) && step.Attempt < w.cfg.MaxAttempts {
-			log.Printf("addon %s/%s: step item=%d seq=%d transient (attempt %d/%d): %v",
-				w.cfg.Capability, w.cfg.Provider, step.ItemID, step.Seq, step.Attempt, w.cfg.MaxAttempts, runErr)
-			return true, w.cfg.Store.Requeue(ctx, *step, runErr.Error())
+		stop = errors.Is(runErr, ErrStopDrain)
+		errMsg := truncateErr(runErr.Error())
+		if (errors.Is(runErr, ErrRetryable) || stop) && step.Attempt < w.cfg.MaxAttempts {
+			log.Printf("addon %s/%s: step item=%d seq=%d transient (attempt %d/%d): %s",
+				w.cfg.Capability, w.cfg.Provider, step.ItemID, step.Seq, step.Attempt, w.cfg.MaxAttempts, errMsg)
+			return true, stop, wrapErr("requeue", w.cfg.Store.Requeue(ctx, *step, errMsg))
 		}
-		log.Printf("addon %s/%s: step item=%d seq=%d failed: %v",
-			w.cfg.Capability, w.cfg.Provider, step.ItemID, step.Seq, runErr)
-		return true, w.cfg.Store.Mark(ctx, *step, StatusFailed, "", runErr.Error())
+		log.Printf("addon %s/%s: step item=%d seq=%d failed: %s",
+			w.cfg.Capability, w.cfg.Provider, step.ItemID, step.Seq, errMsg)
+		return true, stop, wrapErr("mark failed", w.cfg.Store.Mark(ctx, *step, StatusFailed, "", errMsg))
 	}
 
 	if res.Filtered {
@@ -303,9 +324,31 @@ func (w *worker) runOnce(ctx context.Context) (claimed bool, err error) {
 		// is the one sanctioned case where the worker side writes item status — a terminal hand-off
 		// (the item leaves the active set; the reconciler never contends).
 		if err := w.cfg.Store.Mark(ctx, *step, StatusDone, res.OutputRef, ""); err != nil {
-			return true, err
+			return true, false, fmt.Errorf("mark done: %w", err)
 		}
-		return true, w.cfg.Store.FilterItem(ctx, item)
+		return true, false, wrapErr("filter item", w.cfg.Store.FilterItem(ctx, item))
 	}
-	return true, w.cfg.Store.Mark(ctx, *step, StatusDone, res.OutputRef, "")
+	return true, false, wrapErr("mark done", w.cfg.Store.Mark(ctx, *step, StatusDone, res.OutputRef, ""))
+}
+
+// wrapErr adds the failing store step to a non-nil error; nil stays nil.
+func wrapErr(op string, err error) error {
+	if err != nil {
+		return fmt.Errorf("%s: %w", op, err)
+	}
+	return nil
+}
+
+// truncateErr caps a handler error message at maxErrLen before it is logged or persisted,
+// trimming back to the nearest rune boundary so the result is always valid UTF-8 (item_steps.error
+// is a text column; a mid-rune cut would corrupt the write).
+func truncateErr(s string) string {
+	if len(s) <= maxErrLen {
+		return s
+	}
+	cut := maxErrLen
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…"
 }
