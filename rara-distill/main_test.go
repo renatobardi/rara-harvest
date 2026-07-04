@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -1070,11 +1071,18 @@ func TestClaudeCLICuratorExitError(t *testing.T) {
 // limit (in the envelope or on stderr), the error must be typed rateLimitedError so withBreaker
 // counts it and halts the drain instead of burning the queue's attempts.
 func TestClaudeCLICuratorUsageLimitIsRateLimited(t *testing.T) {
+	usageEnvelope := strings.ReplaceAll(
+		claudeEnvelope(t, "error_during_execution", true, "5-hour usage limit reached. Try again later."),
+		"'", "'\\''")
 	cases := map[string]string{
-		"envelope": "printf '%s' '" + strings.ReplaceAll(
-			claudeEnvelope(t, "error_during_execution", true, "5-hour usage limit reached. Try again later."),
-			"'", "'\\''") + "'\n",
-		"stderr": "echo 'Rate limit exceeded, retry after some time' >&2\nexit 1\n",
+		"envelope success exit": "printf '%s' '" + usageEnvelope + "'\n",
+		"stderr":                "echo 'Rate limit exceeded, retry after some time' >&2\nexit 1\n",
+		// The 2026-07-04 production incident: the real CLI reported the usage-limit envelope
+		// on STDOUT while exiting non-zero and writing NOTHING to stderr. The prior
+		// implementation only inspected stderr on a non-zero exit, so this envelope was
+		// silently dropped — the error came back generic (not rateLimitedError), the breaker
+		// never tripped, and 304 items burned through their 5-attempt ceiling in ~2 minutes.
+		"envelope on nonzero exit, empty stderr": "printf '%s' '" + usageEnvelope + "'\nexit 1\n",
 	}
 	for name, body := range cases {
 		bin, _ := writeFakeClaude(t, body)
@@ -1085,6 +1093,60 @@ func TestClaudeCLICuratorUsageLimitIsRateLimited(t *testing.T) {
 			t.Errorf("%s: err = %v, want typed rateLimitedError", name, err)
 		}
 	}
+}
+
+// TestClaudeCLICuratorAPIErrorStatusOnNonzeroExit: an api_error_status is only a reliable
+// retryable signal for 429 (rate limit) and 5xx (upstream fault) — a 4xx like 401/403 is a
+// permanent failure (bad auth, forbidden) that must NOT be classified rate-limited, or the
+// breaker/requeue machinery would keep retrying something that can never succeed.
+func TestClaudeCLICuratorAPIErrorStatusOnNonzeroExit(t *testing.T) {
+	cases := map[string]struct {
+		status        int
+		wantRateLimit bool
+	}{
+		"429 rate limit":   {429, true},
+		"500 server error": {500, true},
+		"503 unavailable":  {503, true},
+		"401 unauthorized": {401, false},
+		"403 forbidden":    {403, false},
+	}
+	for name, tc := range cases {
+		env := fmt.Sprintf(`{"type":"result","subtype":"error_during_execution","is_error":true,"api_error_status":%d,"result":""}`, tc.status)
+		body := "printf '%s' '" + strings.ReplaceAll(env, "'", "'\\''") + "'\nexit 1\n"
+		bin, _ := writeFakeClaude(t, body)
+		c := newClaudeCLICurator(bin, "m")
+		_, err := c.Curate(context.Background(), "s", "i")
+		var rl *rateLimitedError
+		got := errors.As(err, &rl)
+		if got != tc.wantRateLimit {
+			t.Errorf("%s: rate-limited = %v, want %v (err=%v)", name, got, tc.wantRateLimit, err)
+		}
+	}
+}
+
+// TestClaudeCLICuratorPreservesExitError: both the rate-limited and the generic error path
+// must let callers unwrap to the underlying *exec.ExitError (errors.Is/As), not just carry a
+// formatted string — losing the cause makes upstream diagnostics (e.g. distinguishing a signal
+// kill from a normal non-zero exit) impossible.
+func TestClaudeCLICuratorPreservesExitError(t *testing.T) {
+	t.Run("generic error", func(t *testing.T) {
+		bin, _ := writeFakeClaude(t, "echo 'boom' >&2\nexit 1\n")
+		c := newClaudeCLICurator(bin, "m")
+		_, err := c.Curate(context.Background(), "s", "i")
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) {
+			t.Errorf("err = %v, want errors.As to reach *exec.ExitError", err)
+		}
+	})
+	t.Run("rate limited", func(t *testing.T) {
+		bin, _ := writeFakeClaude(t, "echo 'Rate limit exceeded, retry after some time' >&2\nexit 1\n")
+		c := newClaudeCLICurator(bin, "m")
+		_, err := c.Curate(context.Background(), "s", "i")
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) {
+			t.Errorf("err = %v, want errors.As to reach *exec.ExitError", err)
+		}
+	})
 }
 
 // TestClaudeCLICuratorNonJSONEnvelope: garbage on stdout is an error, not silently treated as

@@ -729,10 +729,16 @@ func parseBreakerThreshold(s string) (int, error) {
 
 // rateLimitedError types an upstream 429 that survived every in-call retry, so downstream
 // (distillDoc -> distillHandler -> withBreaker) detects it with errors.As instead of matching on
-// the message text. The text stays postWithRetry's standard format.
-type rateLimitedError struct{ msg string }
+// the message text. The text stays postWithRetry's standard format. cause is optional (nil for
+// the postWithRetry call sites, which only ever had a formatted string) — when set, Unwrap lets
+// callers still reach the original error (e.g. *exec.ExitError) with errors.Is/As.
+type rateLimitedError struct {
+	msg   string
+	cause error
+}
 
 func (e *rateLimitedError) Error() string { return e.msg }
+func (e *rateLimitedError) Unwrap() error { return e.cause }
 
 // ---------------------------------------------------------------------------
 // Real curator: Claude Code CLI (subscription session — no API key)
@@ -762,31 +768,63 @@ func (c *claudeCLICurator) Curate(ctx context.Context, systemPrompt, input strin
 	cmd.Env = claudeCLIEnv(os.Environ())
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	runErr := cmd.Run()
 
-	if err := cmd.Run(); err != nil {
-		msg := fmt.Sprintf("claude CLI: %v: %s", err, truncate(stderr.String(), 500))
-		if isUsageLimitMsg(stderr.String()) {
-			return "", &rateLimitedError{msg: msg}
-		}
-		return "", errors.New(msg)
-	}
-
+	// Best-effort parse regardless of exit status: the 2026-07-04 incident showed the CLI can
+	// report a usage-limit/API error as a JSON envelope on STDOUT while exiting non-zero and
+	// writing nothing to stderr. Only checking stderr on a non-zero exit silently dropped that
+	// signal — the error came back generic, the breaker never tripped, and 304 items burned
+	// through their attempt ceiling in ~2 minutes before anyone noticed.
 	var env struct {
-		IsError bool   `json:"is_error"`
-		Subtype string `json:"subtype"`
-		Result  string `json:"result"`
+		IsError        bool            `json:"is_error"`
+		Subtype        string          `json:"subtype"`
+		Result         string          `json:"result"`
+		APIErrorStatus json.RawMessage `json:"api_error_status"`
 	}
-	if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
+	envOK := json.Unmarshal(stdout.Bytes(), &env) == nil
+	// Only 429 (rate limit) and 5xx (upstream fault) are retryable; a 4xx like 401/403 is
+	// permanent (bad auth, forbidden) and must not be classified rate-limited, or the
+	// breaker/requeue machinery would keep retrying something that can never succeed.
+	status := parseAPIErrorStatus(env.APIErrorStatus)
+	apiRetryable := status == http.StatusTooManyRequests || status >= 500
+
+	if runErr != nil {
+		combined := stderr.String()
+		if envOK {
+			combined += " " + env.Result
+		}
+		text := truncate(combined, 500)
+		if isUsageLimitMsg(combined) || apiRetryable {
+			return "", &rateLimitedError{msg: fmt.Sprintf("claude CLI: %v: %s", runErr, text), cause: runErr}
+		}
+		// %w (not %v) so errors.Is/As can still reach the underlying *exec.ExitError.
+		return "", fmt.Errorf("claude CLI: %w: %s", runErr, text)
+	}
+
+	if !envOK {
 		return "", fmt.Errorf("claude CLI returned non-JSON envelope: %s", truncate(stdout.String(), 200))
 	}
 	if env.IsError || env.Subtype != "success" {
 		msg := fmt.Sprintf("claude CLI error (%s): %s", env.Subtype, truncate(env.Result, 500))
-		if isUsageLimitMsg(env.Result) {
+		if isUsageLimitMsg(env.Result) || apiRetryable {
 			return "", &rateLimitedError{msg: msg}
 		}
 		return "", errors.New(msg)
 	}
 	return env.Result, nil
+}
+
+// parseAPIErrorStatus reads the envelope's api_error_status field as an HTTP status code,
+// returning 0 if it is absent, null, or non-numeric.
+func parseAPIErrorStatus(raw json.RawMessage) int {
+	if len(raw) == 0 {
+		return 0
+	}
+	var status int
+	if json.Unmarshal(raw, &status) != nil {
+		return 0
+	}
+	return status
 }
 
 // claudeCLIEnv strips vars that would make the child CLI believe it runs nested inside another
