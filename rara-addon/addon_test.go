@@ -10,6 +10,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // fakeStore is an in-memory Store: it enforces the same contract the pgx impl does (the claim's
@@ -460,6 +461,20 @@ func TestHandlerErrorTruncatedOnPersist(t *testing.T) {
 	}
 	if len(got.errMsg) > maxErrLen+len("…") {
 		t.Errorf("persisted error is %d bytes, want capped at %d", len(got.errMsg), maxErrLen)
+	}
+}
+
+// TestTruncateErrKeepsValidUTF8: a multibyte error message that lands exactly past maxErrLen must
+// not be cut mid-rune — s[:maxErrLen] on raw bytes can split a multibyte rune and produce invalid
+// UTF-8, which the contract-table write must never carry.
+func TestTruncateErrKeepsValidUTF8(t *testing.T) {
+	huge := "x" + strings.Repeat("é", 5000) // leading ASCII byte forces the cutoff mid-rune
+	got := truncateErr(huge)
+	if !utf8.ValidString(got) {
+		t.Errorf("truncateErr produced invalid UTF-8: %q", got)
+	}
+	if len(got) > maxErrLen+len("…") {
+		t.Errorf("truncated to %d bytes, want capped near %d", len(got), maxErrLen)
 	}
 }
 

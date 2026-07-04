@@ -32,6 +32,7 @@ import (
 	"fmt"
 	"log"
 	"time"
+	"unicode/utf8"
 )
 
 // DefaultMaxAttempts caps how many times a transient (retryable) step is re-queued before it is
@@ -338,10 +339,16 @@ func wrapErr(op string, err error) error {
 	return nil
 }
 
-// truncateErr caps a handler error message at maxErrLen before it is logged or persisted.
+// truncateErr caps a handler error message at maxErrLen before it is logged or persisted,
+// trimming back to the nearest rune boundary so the result is always valid UTF-8 (item_steps.error
+// is a text column; a mid-rune cut would corrupt the write).
 func truncateErr(s string) string {
 	if len(s) <= maxErrLen {
 		return s
 	}
-	return s[:maxErrLen] + "…"
+	cut := maxErrLen
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…"
 }
