@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 )
 
@@ -191,6 +192,135 @@ func TestDispatchOnceMultipleProviders(t *testing.T) {
 	sort.Strings(woken)
 	if woken[0] != "caption-mac" || woken[1] != "sift-cloud" {
 		t.Errorf("woken = %v, want [caption-mac sift-cloud]", woken)
+	}
+}
+
+// --- per-provider wake cooldown ---------------------------------------------
+//
+// The 2026-07-04 incident: the dispatcher ticks every ~10s and re-wakes any provider with
+// pending assigned steps, with no memory of the last wake. Against an on_demand Cloud Run
+// provider each wake spins up a brand-new container — a fresh process, a fresh in-process
+// circuit breaker — so a groq rate-limit storm got re-triggered every tick instead of backing
+// off. The cooldown makes DispatchOnce skip re-waking a provider it already woke inside the
+// window, regardless of whether that wake succeeded or failed.
+
+func TestDispatchOnceSkipsRecentlyWokenProvider(t *testing.T) {
+	db := &mockDispatchDB{
+		steps:     []AssignedStep{{ItemID: 1, Seq: 2, AssignedProvider: "distill-cloud"}},
+		providers: map[string]DispatchProvider{"distill-cloud": {Name: "distill-cloud", Runtime: runtimeCloudRun}},
+	}
+	clock := time.Date(2026, 7, 4, 2, 30, 0, 0, time.UTC)
+	d := &Dispatcher{db: db, runner: &fakeTransport{}, cooldown: 60 * time.Second, now: func() time.Time { return clock }}
+
+	if err := d.DispatchOnce(context.Background()); err != nil {
+		t.Fatalf("first DispatchOnce: %v", err)
+	}
+	tr := d.runner.(*fakeTransport)
+	if len(tr.called) != 1 {
+		t.Fatalf("first pass called %d times, want 1", len(tr.called))
+	}
+
+	clock = clock.Add(10 * time.Second) // still within the 60s cooldown
+	if err := d.DispatchOnce(context.Background()); err != nil {
+		t.Fatalf("second DispatchOnce: %v", err)
+	}
+	if len(tr.called) != 1 {
+		t.Errorf("called %d times after a pass inside the cooldown, want still 1 (skipped)", len(tr.called))
+	}
+}
+
+func TestDispatchOnceWakesAgainAfterCooldownElapses(t *testing.T) {
+	db := &mockDispatchDB{
+		steps:     []AssignedStep{{ItemID: 1, Seq: 2, AssignedProvider: "distill-cloud"}},
+		providers: map[string]DispatchProvider{"distill-cloud": {Name: "distill-cloud", Runtime: runtimeCloudRun}},
+	}
+	clock := time.Date(2026, 7, 4, 2, 30, 0, 0, time.UTC)
+	d := &Dispatcher{db: db, runner: &fakeTransport{}, cooldown: 60 * time.Second, now: func() time.Time { return clock }}
+
+	if err := d.DispatchOnce(context.Background()); err != nil {
+		t.Fatalf("first DispatchOnce: %v", err)
+	}
+	clock = clock.Add(61 * time.Second) // cooldown elapsed
+	if err := d.DispatchOnce(context.Background()); err != nil {
+		t.Fatalf("second DispatchOnce: %v", err)
+	}
+	tr := d.runner.(*fakeTransport)
+	if len(tr.called) != 2 {
+		t.Errorf("called %d times after the cooldown elapsed, want 2", len(tr.called))
+	}
+}
+
+// TestDispatchOnceZeroCooldownAlwaysWakes: the zero value (no cooldown configured) must behave
+// exactly like before this feature existed — every pass wakes every assigned provider.
+func TestDispatchOnceZeroCooldownAlwaysWakes(t *testing.T) {
+	db := &mockDispatchDB{
+		steps:     []AssignedStep{{ItemID: 1, Seq: 2, AssignedProvider: "sift-cloud"}},
+		providers: map[string]DispatchProvider{"sift-cloud": {Name: "sift-cloud", Runtime: runtimeCloudRun}},
+	}
+	d := &Dispatcher{db: db, runner: &fakeTransport{}}
+	for i := 0; i < 3; i++ {
+		if err := d.DispatchOnce(context.Background()); err != nil {
+			t.Fatalf("pass %d: %v", i, err)
+		}
+	}
+	tr := d.runner.(*fakeTransport)
+	if len(tr.called) != 3 {
+		t.Errorf("called %d times with no cooldown configured, want 3 (unthrottled)", len(tr.called))
+	}
+}
+
+// TestDispatchOnceCooldownIsPerProvider: one provider recently woken (skipped) must not hold
+// back a different provider that hasn't been woken yet.
+func TestDispatchOnceCooldownIsPerProvider(t *testing.T) {
+	db := &mockDispatchDB{
+		steps: []AssignedStep{
+			{ItemID: 1, Seq: 2, AssignedProvider: "distill-cloud"},
+		},
+		providers: map[string]DispatchProvider{
+			"distill-cloud": {Name: "distill-cloud", Runtime: runtimeCloudRun},
+			"sift-cloud":    {Name: "sift-cloud", Runtime: runtimeCloudRun},
+		},
+	}
+	clock := time.Date(2026, 7, 4, 2, 30, 0, 0, time.UTC)
+	d := &Dispatcher{db: db, runner: &fakeTransport{}, cooldown: 60 * time.Second, now: func() time.Time { return clock }}
+	if err := d.DispatchOnce(context.Background()); err != nil {
+		t.Fatalf("first DispatchOnce: %v", err)
+	}
+
+	db.steps = append(db.steps, AssignedStep{ItemID: 2, Seq: 2, AssignedProvider: "sift-cloud"})
+	if err := d.DispatchOnce(context.Background()); err != nil {
+		t.Fatalf("second DispatchOnce: %v", err)
+	}
+	tr := d.runner.(*fakeTransport)
+	woken := make([]string, len(tr.called))
+	for i, r := range tr.called {
+		woken[i] = r.App
+	}
+	if len(woken) != 2 || woken[0] != "distill-cloud" || woken[1] != "sift-cloud" {
+		t.Errorf("woken = %v, want [distill-cloud sift-cloud] (sift-cloud is new, not cooling down)", woken)
+	}
+}
+
+// TestDispatchOnceCooldownAppliesAfterRunnerError: a failed wake still starts the cooldown — a
+// provider that errors on every wake must not be hammered every tick either.
+func TestDispatchOnceCooldownAppliesAfterRunnerError(t *testing.T) {
+	db := &mockDispatchDB{
+		steps:     []AssignedStep{{ItemID: 1, Seq: 2, AssignedProvider: "distill-cloud"}},
+		providers: map[string]DispatchProvider{"distill-cloud": {Name: "distill-cloud", Runtime: runtimeCloudRun}},
+	}
+	clock := time.Date(2026, 7, 4, 2, 30, 0, 0, time.UTC)
+	tr := &fakeTransport{err: errBoom{}}
+	d := &Dispatcher{db: db, runner: tr, cooldown: 60 * time.Second, now: func() time.Time { return clock }}
+
+	if err := d.DispatchOnce(context.Background()); err != nil {
+		t.Fatalf("first DispatchOnce: %v", err)
+	}
+	clock = clock.Add(10 * time.Second)
+	if err := d.DispatchOnce(context.Background()); err != nil {
+		t.Fatalf("second DispatchOnce: %v", err)
+	}
+	if len(tr.called) != 1 {
+		t.Errorf("called %d times after an errored wake within cooldown, want still 1", len(tr.called))
 	}
 }
 

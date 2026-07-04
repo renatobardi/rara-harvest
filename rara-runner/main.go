@@ -134,11 +134,25 @@ func runDispatch() {
 		interval = time.Duration(n) * time.Second
 	}
 
+	// DISPATCH_COOLDOWN_SECONDS paces repeat wakes of the same provider (see Dispatcher.cooldown):
+	// without it, a struggling on_demand Cloud Run provider gets a brand-new container — and a
+	// fresh in-process circuit breaker — every tick instead of backing off. Default 60s comfortably
+	// exceeds the dispatch interval so a provider isn't re-woken before its last execution could
+	// plausibly matter; 0 disables it (unthrottled, the pre-existing behavior).
+	cooldown := 60 * time.Second
+	if v := os.Getenv("DISPATCH_COOLDOWN_SECONDS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			log.Fatalf("DISPATCH_COOLDOWN_SECONDS must be a non-negative integer, got %q", v)
+		}
+		cooldown = time.Duration(n) * time.Second
+	}
+
 	db := &pgxDispatchDB{pool: pool}
 	runner := newDispatchRunnerFromEnv()
-	d := &Dispatcher{db: db, runner: runner}
+	d := &Dispatcher{db: db, runner: runner, cooldown: cooldown}
 
-	log.Printf("rara-runner dispatch: starting (interval=%s)", interval)
+	log.Printf("rara-runner dispatch: starting (interval=%s, cooldown=%s)", interval, cooldown)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
