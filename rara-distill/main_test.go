@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -1094,20 +1095,58 @@ func TestClaudeCLICuratorUsageLimitIsRateLimited(t *testing.T) {
 	}
 }
 
-// TestClaudeCLICuratorAPIErrorStatusOnNonzeroExit: even without a textual usage-limit marker,
-// a non-null api_error_status in the envelope on a non-zero exit is itself a strong signal of
-// an upstream/API-level failure (as opposed to e.g. a local CLI crash) — treat it as retryable
-// so the breaker gets a chance to see the pattern instead of burning attempts on an unknown.
+// TestClaudeCLICuratorAPIErrorStatusOnNonzeroExit: an api_error_status is only a reliable
+// retryable signal for 429 (rate limit) and 5xx (upstream fault) — a 4xx like 401/403 is a
+// permanent failure (bad auth, forbidden) that must NOT be classified rate-limited, or the
+// breaker/requeue machinery would keep retrying something that can never succeed.
 func TestClaudeCLICuratorAPIErrorStatusOnNonzeroExit(t *testing.T) {
-	env := `{"type":"result","subtype":"error_during_execution","is_error":true,"api_error_status":429,"result":""}`
-	body := "printf '%s' '" + strings.ReplaceAll(env, "'", "'\\''") + "'\nexit 1\n"
-	bin, _ := writeFakeClaude(t, body)
-	c := newClaudeCLICurator(bin, "m")
-	_, err := c.Curate(context.Background(), "s", "i")
-	var rl *rateLimitedError
-	if !errors.As(err, &rl) {
-		t.Errorf("err = %v, want typed rateLimitedError (api_error_status=429)", err)
+	cases := map[string]struct {
+		status        int
+		wantRateLimit bool
+	}{
+		"429 rate limit":   {429, true},
+		"500 server error": {500, true},
+		"503 unavailable":  {503, true},
+		"401 unauthorized": {401, false},
+		"403 forbidden":    {403, false},
 	}
+	for name, tc := range cases {
+		env := fmt.Sprintf(`{"type":"result","subtype":"error_during_execution","is_error":true,"api_error_status":%d,"result":""}`, tc.status)
+		body := "printf '%s' '" + strings.ReplaceAll(env, "'", "'\\''") + "'\nexit 1\n"
+		bin, _ := writeFakeClaude(t, body)
+		c := newClaudeCLICurator(bin, "m")
+		_, err := c.Curate(context.Background(), "s", "i")
+		var rl *rateLimitedError
+		got := errors.As(err, &rl)
+		if got != tc.wantRateLimit {
+			t.Errorf("%s: rate-limited = %v, want %v (err=%v)", name, got, tc.wantRateLimit, err)
+		}
+	}
+}
+
+// TestClaudeCLICuratorPreservesExitError: both the rate-limited and the generic error path
+// must let callers unwrap to the underlying *exec.ExitError (errors.Is/As), not just carry a
+// formatted string — losing the cause makes upstream diagnostics (e.g. distinguishing a signal
+// kill from a normal non-zero exit) impossible.
+func TestClaudeCLICuratorPreservesExitError(t *testing.T) {
+	t.Run("generic error", func(t *testing.T) {
+		bin, _ := writeFakeClaude(t, "echo 'boom' >&2\nexit 1\n")
+		c := newClaudeCLICurator(bin, "m")
+		_, err := c.Curate(context.Background(), "s", "i")
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) {
+			t.Errorf("err = %v, want errors.As to reach *exec.ExitError", err)
+		}
+	})
+	t.Run("rate limited", func(t *testing.T) {
+		bin, _ := writeFakeClaude(t, "echo 'Rate limit exceeded, retry after some time' >&2\nexit 1\n")
+		c := newClaudeCLICurator(bin, "m")
+		_, err := c.Curate(context.Background(), "s", "i")
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) {
+			t.Errorf("err = %v, want errors.As to reach *exec.ExitError", err)
+		}
+	})
 }
 
 // TestClaudeCLICuratorNonJSONEnvelope: garbage on stdout is an error, not silently treated as

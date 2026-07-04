@@ -729,10 +729,16 @@ func parseBreakerThreshold(s string) (int, error) {
 
 // rateLimitedError types an upstream 429 that survived every in-call retry, so downstream
 // (distillDoc -> distillHandler -> withBreaker) detects it with errors.As instead of matching on
-// the message text. The text stays postWithRetry's standard format.
-type rateLimitedError struct{ msg string }
+// the message text. The text stays postWithRetry's standard format. cause is optional (nil for
+// the postWithRetry call sites, which only ever had a formatted string) — when set, Unwrap lets
+// callers still reach the original error (e.g. *exec.ExitError) with errors.Is/As.
+type rateLimitedError struct {
+	msg   string
+	cause error
+}
 
 func (e *rateLimitedError) Error() string { return e.msg }
+func (e *rateLimitedError) Unwrap() error { return e.cause }
 
 // ---------------------------------------------------------------------------
 // Real curator: Claude Code CLI (subscription session — no API key)
@@ -776,18 +782,23 @@ func (c *claudeCLICurator) Curate(ctx context.Context, systemPrompt, input strin
 		APIErrorStatus json.RawMessage `json:"api_error_status"`
 	}
 	envOK := json.Unmarshal(stdout.Bytes(), &env) == nil
-	apiError := envOK && len(env.APIErrorStatus) > 0 && string(env.APIErrorStatus) != "null"
+	// Only 429 (rate limit) and 5xx (upstream fault) are retryable; a 4xx like 401/403 is
+	// permanent (bad auth, forbidden) and must not be classified rate-limited, or the
+	// breaker/requeue machinery would keep retrying something that can never succeed.
+	status := parseAPIErrorStatus(env.APIErrorStatus)
+	apiRetryable := status == http.StatusTooManyRequests || status >= 500
 
 	if runErr != nil {
 		combined := stderr.String()
 		if envOK {
 			combined += " " + env.Result
 		}
-		msg := fmt.Sprintf("claude CLI: %v: %s", runErr, truncate(combined, 500))
-		if isUsageLimitMsg(combined) || apiError {
-			return "", &rateLimitedError{msg: msg}
+		text := truncate(combined, 500)
+		if isUsageLimitMsg(combined) || apiRetryable {
+			return "", &rateLimitedError{msg: fmt.Sprintf("claude CLI: %v: %s", runErr, text), cause: runErr}
 		}
-		return "", errors.New(msg)
+		// %w (not %v) so errors.Is/As can still reach the underlying *exec.ExitError.
+		return "", fmt.Errorf("claude CLI: %w: %s", runErr, text)
 	}
 
 	if !envOK {
@@ -795,12 +806,25 @@ func (c *claudeCLICurator) Curate(ctx context.Context, systemPrompt, input strin
 	}
 	if env.IsError || env.Subtype != "success" {
 		msg := fmt.Sprintf("claude CLI error (%s): %s", env.Subtype, truncate(env.Result, 500))
-		if isUsageLimitMsg(env.Result) || apiError {
+		if isUsageLimitMsg(env.Result) || apiRetryable {
 			return "", &rateLimitedError{msg: msg}
 		}
 		return "", errors.New(msg)
 	}
 	return env.Result, nil
+}
+
+// parseAPIErrorStatus reads the envelope's api_error_status field as an HTTP status code,
+// returning 0 if it is absent, null, or non-numeric.
+func parseAPIErrorStatus(raw json.RawMessage) int {
+	if len(raw) == 0 {
+		return 0
+	}
+	var status int
+	if json.Unmarshal(raw, &status) != nil {
+		return 0
+	}
+	return status
 }
 
 // claudeCLIEnv strips vars that would make the child CLI believe it runs nested inside another
