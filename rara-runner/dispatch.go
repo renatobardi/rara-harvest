@@ -72,9 +72,43 @@ type DispatchDB interface {
 // Dispatcher reads desired state from the DB and wakes providers. One wake per provider per pass
 // (coalesced): a single Cloud Run `run` drains the whole queue for that provider, so fan-out is
 // wasteful and can swarm scale-to-zero jobs.
+//
+// cooldown paces repeat wakes of the SAME provider across passes: an on_demand Cloud Run wake
+// spins up a brand-new container (a fresh process, a fresh in-process circuit breaker), so ticking
+// every few seconds regardless of the last wake can re-trigger a struggling upstream (e.g. a groq
+// rate-limit storm) on every pass instead of backing off. Zero means no cooldown (unthrottled,
+// the pre-existing behavior). now is the injectable clock seam for tests; nil uses time.Now.
 type Dispatcher struct {
-	db     DispatchDB
-	runner Runner
+	db       DispatchDB
+	runner   Runner
+	cooldown time.Duration
+	now      func() time.Time
+
+	lastWake map[string]time.Time // provider name -> last wake attempt (set on both success and error)
+}
+
+func (d *Dispatcher) clock() time.Time {
+	if d.now != nil {
+		return d.now()
+	}
+	return time.Now()
+}
+
+// cooling reports whether name was woken within the cooldown window (and, as a side effect,
+// stamps this attempt so the NEXT call sees it). Always false when cooldown <= 0.
+func (d *Dispatcher) cooling(name string) bool {
+	if d.cooldown <= 0 {
+		return false
+	}
+	now := d.clock()
+	if d.lastWake == nil {
+		d.lastWake = make(map[string]time.Time)
+	}
+	if last, ok := d.lastWake[name]; ok && now.Sub(last) < d.cooldown {
+		return true
+	}
+	d.lastWake[name] = now
+	return false
 }
 
 // DispatchOnce performs a single pass: wake assigned workers (coalesced by provider) and any
@@ -94,6 +128,10 @@ func (d *Dispatcher) DispatchOnce(ctx context.Context) error {
 	}
 
 	for name := range seen {
+		if d.cooling(name) {
+			log.Printf("dispatch: %q woken recently; skipping this pass (cooldown)", name)
+			continue
+		}
 		prov, ok, err := d.db.GetProvider(ctx, name)
 		if err != nil {
 			log.Printf("dispatch: get provider %q: %v", name, err)
