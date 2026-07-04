@@ -178,6 +178,10 @@ type Distillation struct {
 	RecipeSHA256     string
 	Status           string // done | failed
 	Error            string
+
+	// rateLimited marks a failure caused by an upstream 429 (typed, in-memory only — never
+	// persisted); the handler propagates it so withBreaker counts consecutive rate-limits.
+	rateLimited bool
 }
 
 // Config is the runtime configuration, sourced from environment variables.
@@ -597,6 +601,8 @@ func distillDoc(ctx context.Context, cur Curator, engineName string, r Recipe, d
 		raw, err := cur.Curate(ctx, r.buildSystemPrompt(p), input)
 		if err != nil {
 			d.Status, d.Error = statusFailed, err.Error()
+			var rl *rateLimitedError
+			d.rateLimited = errors.As(err, &rl)
 			return d
 		}
 		prev = parseCuration(raw)
@@ -686,10 +692,57 @@ func distillHandler(store DistillStore, cur Curator, engineName string, rr *reci
 			// transient 429/5xx within a call; this covers a timeout or a sustained outage so a
 			// blip does not terminally fail the item on the first miss. A persistent failure still
 			// terminates — just after the bounded retries.
+			if d.rateLimited {
+				// Keep the typed 429 in the chain so withBreaker can count it with errors.As.
+				return addon.Result{}, fmt.Errorf("destilar %s: %w: %w", doc.SourceKey, addon.ErrRetryable, &rateLimitedError{msg: d.Error})
+			}
 			return addon.Result{}, fmt.Errorf("destilar %s: %w: %s", doc.SourceKey, addon.ErrRetryable, d.Error)
 		}
 		log.Printf("distilled %s (%s, structured=%s) -> distillation %d", doc.SourceKey, doc.Title, d.StructuredStatus, id)
 		return addon.Result{OutputRef: strconv.Itoa(id)}, nil
+	}
+}
+
+// parseBreakerThreshold parses DISTILL_429_BREAKER: unset -> 3 consecutive 429s; otherwise a
+// positive integer. Anything else is a config error (fail-fast, matching the repo convention).
+func parseBreakerThreshold(s string) (int, error) {
+	if s == "" {
+		return 3, nil
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 1 {
+		return 0, fmt.Errorf("DISTILL_429_BREAKER must be a positive integer, got %q", s)
+	}
+	return n, nil
+}
+
+// rateLimitedError types an upstream 429 that survived every in-call retry, so downstream
+// (distillDoc -> distillHandler -> withBreaker) detects it with errors.As instead of matching on
+// the message text. The text stays postWithRetry's standard format.
+type rateLimitedError struct{ msg string }
+
+func (e *rateLimitedError) Error() string { return e.msg }
+
+// withBreaker wraps the handler with a 429 circuit breaker: after threshold CONSECUTIVE
+// rate-limited items it wraps the error with addon.ErrStopDrain, so the SDK requeues the current
+// step and halts the drain instead of burning every queued item's attempts against a rate-limited
+// upstream (the 2026-06-30 incident: 323 steps failed in 20 minutes). Any success or non-429
+// failure resets the streak. The drain loop is single-goroutine, so a plain counter is safe.
+func withBreaker(h addon.Handler, threshold int) addon.Handler {
+	consecutive := 0
+	return func(ctx context.Context, item addon.Item, step addon.Step) (addon.Result, error) {
+		res, err := h(ctx, item, step)
+		var rl *rateLimitedError
+		if err == nil || !errors.As(err, &rl) {
+			consecutive = 0
+			return res, err
+		}
+		consecutive++
+		if consecutive < threshold {
+			return res, err
+		}
+		consecutive = 0 // fresh streak if a resident worker drains again after the halt
+		return res, fmt.Errorf("circuit breaker: %d consecutive 429s: %w: %w", threshold, addon.ErrStopDrain, err)
 	}
 }
 
@@ -721,6 +774,9 @@ func postWithRetry(ctx context.Context, build func() (*http.Request, error)) ([]
 		retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
 		resp.Body.Close()
 		lastErr = fmt.Errorf("LLM API error (status %d): %s", resp.StatusCode, truncate(string(body), 500))
+		if resp.StatusCode == http.StatusTooManyRequests {
+			lastErr = &rateLimitedError{msg: lastErr.Error()}
+		}
 
 		transient := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500
 		if !transient || attempt >= maxCurateRetries {
@@ -1307,6 +1363,11 @@ func main() {
 		log.Fatalf("Curator init failed: %v", err)
 	}
 
+	breaker, err := parseBreakerThreshold(os.Getenv("DISTILL_429_BREAKER"))
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
+
 	// The recipe normally comes from the flow step config; these are the fallback default.
 	rr := newRecipeResolver(splitCSV(cfg.Patterns), cfg.ContextName, cfg.StrategyName)
 	if _, err := rr.resolve(nil); err != nil {
@@ -1336,7 +1397,7 @@ func main() {
 		PokeAddr:     os.Getenv("POKE_ADDR"),
 		PokeToken:    os.Getenv("POKE_TOKEN"),
 	}
-	if err := addon.Run(ctx, ac, distillHandler(&appDB{pool: pool}, cur, engineName, rr)); err != nil {
+	if err := addon.Run(ctx, ac, withBreaker(distillHandler(&appDB{pool: pool}, cur, engineName, rr), breaker)); err != nil {
 		log.Fatalf("distill worker %s/%s: %v", capDestilar, provider, err)
 	}
 	log.Printf("rara-distill worker %s/%s: queue drained", capDestilar, provider)
