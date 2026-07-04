@@ -762,26 +762,40 @@ func (c *claudeCLICurator) Curate(ctx context.Context, systemPrompt, input strin
 	cmd.Env = claudeCLIEnv(os.Environ())
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	runErr := cmd.Run()
 
-	if err := cmd.Run(); err != nil {
-		msg := fmt.Sprintf("claude CLI: %v: %s", err, truncate(stderr.String(), 500))
-		if isUsageLimitMsg(stderr.String()) {
+	// Best-effort parse regardless of exit status: the 2026-07-04 incident showed the CLI can
+	// report a usage-limit/API error as a JSON envelope on STDOUT while exiting non-zero and
+	// writing nothing to stderr. Only checking stderr on a non-zero exit silently dropped that
+	// signal — the error came back generic, the breaker never tripped, and 304 items burned
+	// through their attempt ceiling in ~2 minutes before anyone noticed.
+	var env struct {
+		IsError        bool            `json:"is_error"`
+		Subtype        string          `json:"subtype"`
+		Result         string          `json:"result"`
+		APIErrorStatus json.RawMessage `json:"api_error_status"`
+	}
+	envOK := json.Unmarshal(stdout.Bytes(), &env) == nil
+	apiError := envOK && len(env.APIErrorStatus) > 0 && string(env.APIErrorStatus) != "null"
+
+	if runErr != nil {
+		combined := stderr.String()
+		if envOK {
+			combined += " " + env.Result
+		}
+		msg := fmt.Sprintf("claude CLI: %v: %s", runErr, truncate(combined, 500))
+		if isUsageLimitMsg(combined) || apiError {
 			return "", &rateLimitedError{msg: msg}
 		}
 		return "", errors.New(msg)
 	}
 
-	var env struct {
-		IsError bool   `json:"is_error"`
-		Subtype string `json:"subtype"`
-		Result  string `json:"result"`
-	}
-	if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
+	if !envOK {
 		return "", fmt.Errorf("claude CLI returned non-JSON envelope: %s", truncate(stdout.String(), 200))
 	}
 	if env.IsError || env.Subtype != "success" {
 		msg := fmt.Sprintf("claude CLI error (%s): %s", env.Subtype, truncate(env.Result, 500))
-		if isUsageLimitMsg(env.Result) {
+		if isUsageLimitMsg(env.Result) || apiError {
 			return "", &rateLimitedError{msg: msg}
 		}
 		return "", errors.New(msg)

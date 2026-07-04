@@ -1070,11 +1070,18 @@ func TestClaudeCLICuratorExitError(t *testing.T) {
 // limit (in the envelope or on stderr), the error must be typed rateLimitedError so withBreaker
 // counts it and halts the drain instead of burning the queue's attempts.
 func TestClaudeCLICuratorUsageLimitIsRateLimited(t *testing.T) {
+	usageEnvelope := strings.ReplaceAll(
+		claudeEnvelope(t, "error_during_execution", true, "5-hour usage limit reached. Try again later."),
+		"'", "'\\''")
 	cases := map[string]string{
-		"envelope": "printf '%s' '" + strings.ReplaceAll(
-			claudeEnvelope(t, "error_during_execution", true, "5-hour usage limit reached. Try again later."),
-			"'", "'\\''") + "'\n",
-		"stderr": "echo 'Rate limit exceeded, retry after some time' >&2\nexit 1\n",
+		"envelope success exit": "printf '%s' '" + usageEnvelope + "'\n",
+		"stderr":                "echo 'Rate limit exceeded, retry after some time' >&2\nexit 1\n",
+		// The 2026-07-04 production incident: the real CLI reported the usage-limit envelope
+		// on STDOUT while exiting non-zero and writing NOTHING to stderr. The prior
+		// implementation only inspected stderr on a non-zero exit, so this envelope was
+		// silently dropped — the error came back generic (not rateLimitedError), the breaker
+		// never tripped, and 304 items burned through their 5-attempt ceiling in ~2 minutes.
+		"envelope on nonzero exit, empty stderr": "printf '%s' '" + usageEnvelope + "'\nexit 1\n",
 	}
 	for name, body := range cases {
 		bin, _ := writeFakeClaude(t, body)
@@ -1084,6 +1091,22 @@ func TestClaudeCLICuratorUsageLimitIsRateLimited(t *testing.T) {
 		if !errors.As(err, &rl) {
 			t.Errorf("%s: err = %v, want typed rateLimitedError", name, err)
 		}
+	}
+}
+
+// TestClaudeCLICuratorAPIErrorStatusOnNonzeroExit: even without a textual usage-limit marker,
+// a non-null api_error_status in the envelope on a non-zero exit is itself a strong signal of
+// an upstream/API-level failure (as opposed to e.g. a local CLI crash) — treat it as retryable
+// so the breaker gets a chance to see the pattern instead of burning attempts on an unknown.
+func TestClaudeCLICuratorAPIErrorStatusOnNonzeroExit(t *testing.T) {
+	env := `{"type":"result","subtype":"error_during_execution","is_error":true,"api_error_status":429,"result":""}`
+	body := "printf '%s' '" + strings.ReplaceAll(env, "'", "'\\''") + "'\nexit 1\n"
+	bin, _ := writeFakeClaude(t, body)
+	c := newClaudeCLICurator(bin, "m")
+	_, err := c.Curate(context.Background(), "s", "i")
+	var rl *rateLimitedError
+	if !errors.As(err, &rl) {
+		t.Errorf("err = %v, want typed rateLimitedError (api_error_status=429)", err)
 	}
 }
 
