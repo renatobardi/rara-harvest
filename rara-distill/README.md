@@ -177,9 +177,10 @@ go run .                      # claim & drain the destilar queue for DISTILL_PRO
 | `DISTILL_PROVIDER` | — (required) | the provider this worker serves (e.g. `distill` \| `distill-vpc`); the SDK claims its steps by `(destilar, this provider)` |
 | `WORK_POLL_INTERVAL` | (unset → on_demand) | resident safety-net poll cadence (Go duration or bare seconds) |
 | `POKE_ADDR` / `POKE_TOKEN` | (unset) | tailnet poke listener (`POST /poke`, Bearer) for symmetric activation |
-| `CURATE_ENGINE` | `gemini` | `gemini` \| `claude` \| `groq` \| `litellm` |
-| `GEMINI_API_KEY` / `ANTHROPIC_API_KEY` / `GROQ_API_KEY` | — | per engine |
-| `GEMINI_MODEL` / `CLAUDE_MODEL` / `GROQ_MODEL` | sane defaults | model override |
+| `CURATE_ENGINE` | `gemini` | `gemini` \| `claude` \| `groq` \| `litellm` \| `claude-cli` (Mac-first default, see [install-mac.sh](./install-mac.sh)) |
+| `GEMINI_API_KEY` / `ANTHROPIC_API_KEY` / `GROQ_API_KEY` | — | per engine (not used by `claude-cli` — it bills the CLI's logged-in subscription, no key) |
+| `GEMINI_MODEL` / `CLAUDE_MODEL` / `GROQ_MODEL` | sane defaults | model override (`CLAUDE_MODEL` also selects the `claude-cli` model) |
+| `CLAUDE_CLI_BIN` | `claude` (from `PATH`) | absolute path to the `claude` binary for `CURATE_ENGINE=claude-cli` — launchd has a minimal `PATH` |
 | `LITELLM_BASE_URL` / `LITELLM_API_KEY` / `LITELLM_MODEL` | — / — / `claude-sonnet-4-6` | self-hosted gateway (OpenAI-compatible); key optional. See [litellm/](./litellm/) |
 | `DISTILL_PATTERNS` | `extract_wisdom` | **fallback** default recipe (CSV; many = session chain). Per-item recipe normally comes from `flow_steps.options.recipe` |
 | `DISTILL_CONTEXT` | (none) | fallback default context file in `contexts/<name>.md` |

@@ -790,12 +790,13 @@ func (c *claudeCLICurator) Curate(ctx context.Context, systemPrompt, input strin
 }
 
 // claudeCLIEnv strips vars that would make the child CLI believe it runs nested inside another
-// Claude Code session (multica's buildEnv lesson), plus the API key so the call can only bill
-// the logged-in subscription.
+// Claude Code session (multica's buildEnv lesson), plus the whole ANTHROPIC_ prefix (API key,
+// auth token, a custom base URL) so the call can only bill the logged-in subscription session —
+// never fall back to API-key or proxy auth.
 func claudeCLIEnv(parent []string) []string {
 	out := make([]string, 0, len(parent))
 	for _, kv := range parent {
-		if strings.HasPrefix(kv, "CLAUDECODE") || strings.HasPrefix(kv, "CLAUDE_CODE_") || strings.HasPrefix(kv, "ANTHROPIC_API_KEY=") {
+		if strings.HasPrefix(kv, "CLAUDECODE") || strings.HasPrefix(kv, "CLAUDE_CODE_") || strings.HasPrefix(kv, "ANTHROPIC_") {
 			continue
 		}
 		out = append(out, kv)

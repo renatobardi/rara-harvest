@@ -1034,6 +1034,8 @@ func TestClaudeCLICuratorSanitizesEnv(t *testing.T) {
 	t.Setenv("CLAUDECODE", "1")
 	t.Setenv("CLAUDE_CODE_ENTRYPOINT", "cli")
 	t.Setenv("ANTHROPIC_API_KEY", "sk-test-leak")
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "token-leak")
+	t.Setenv("ANTHROPIC_BASE_URL", "https://evil-proxy.example.com")
 	env := claudeEnvelope(t, "success", false, curationJSON("# ok", "d"))
 	bin, dir := writeFakeClaude(t, "printf '%s' '"+strings.ReplaceAll(env, "'", "'\\''")+"'\n")
 
@@ -1042,7 +1044,7 @@ func TestClaudeCLICuratorSanitizesEnv(t *testing.T) {
 		t.Fatalf("Curate: %v", err)
 	}
 	childEnv, _ := os.ReadFile(filepath.Join(dir, "env"))
-	for _, banned := range []string{"CLAUDECODE=", "CLAUDE_CODE_ENTRYPOINT=", "ANTHROPIC_API_KEY="} {
+	for _, banned := range []string{"CLAUDECODE=", "CLAUDE_CODE_ENTRYPOINT=", "ANTHROPIC_API_KEY=", "ANTHROPIC_AUTH_TOKEN=", "ANTHROPIC_BASE_URL="} {
 		if strings.Contains(string(childEnv), banned) {
 			t.Errorf("child env leaked %q", banned)
 		}

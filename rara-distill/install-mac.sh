@@ -18,7 +18,7 @@ LABEL="com.rara.distill"
 # ---------------------------------------------------------------------------
 # 0. Directory guard — must be run from rara-distill/
 # ---------------------------------------------------------------------------
-if [ ! -f "go.mod" ] || [ ! -d "patterns" ]; then
+if [[ ! -f "go.mod" ]] || [[ ! -d "patterns" ]]; then
     echo "!! Run this script from the rara-distill/ directory:"
     echo "   cd rara-distill && bash install-mac.sh"
     exit 1
@@ -34,7 +34,7 @@ for cmd in go claude; do
         missing+=("$cmd")
     fi
 done
-if [ ${#missing[@]} -gt 0 ]; then
+if [[ ${#missing[@]} -gt 0 ]]; then
     echo ""
     echo "!! Missing commands: ${missing[*]}"
     echo "   go:     brew install go"
@@ -53,7 +53,7 @@ mkdir -p "$INSTALL_DIR" "$LOG_DIR"
 # ---------------------------------------------------------------------------
 # 3. Create .env if it does not exist (exits here on first run)
 # ---------------------------------------------------------------------------
-if [ ! -f "$INSTALL_DIR/.env" ]; then
+if [[ ! -f "$INSTALL_DIR/.env" ]]; then
     echo ""
     echo "==> Creating $INSTALL_DIR/.env..."
     cat > "$INSTALL_DIR/.env" << ENV
@@ -79,6 +79,7 @@ WORK_POLL_INTERVAL=30s
 # Default recipe fallback (per-item recipe comes from flow_steps.options.recipe).
 DISTILL_PATTERNS=extract_wisdom
 ENV
+    chmod 600 "$INSTALL_DIR/.env" # contains DATABASE_URL — owner-read/write only
     echo ""
     echo "!! REQUIRED STEP: edit the file before continuing:"
     echo "   \$EDITOR $INSTALL_DIR/.env"
